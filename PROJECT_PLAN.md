@@ -1,149 +1,242 @@
-# Technical Implementation Plan & Architecture Specification
+# Technical Implementation Plan & Architecture Specification (Revised)
 ## PG Manager by The Layout Office
 
-**Document Version:** 1.0.0  
+**Document Version:** 2.0.0  
 **Date:** November 20, 2026  
-**Status:** Architectural Proposal (Pending User Approval)  
+**Status:** Architecture Refinement & Security Hardening (Awaiting Explicit Approval)  
 **Author:** Senior Full-Stack Software Architect & Technical Lead  
 
 ---
 
-## 1. Executive Summary & Workspace Assessment
+## 1. Executive Summary & Audit Log of Revisions
 
-### 1.1 Current Workspace State
-An exhaustive inspection of the working directory (`D:\TECH\PG MANAGEMENT`) confirms:
-- **Project Status:** Fresh workspace. No existing application codebase, Next.js configuration, or `package.json` file is present.
-- **Directory Contents:** The workspace contains only an `.agents/` folder housing AI development skills and configurations. No files will be overwritten or corrupted.
-- **Git Status:** Git repository is not yet initialized (`fatal: not a git repository`).
-- **Host Runtime Environment:**
-  - **Node.js:** `v25.1.0` (Active)
-  - **npm:** `11.6.2` (Active)
-  - **Git:** `2.51.2.windows.1` (Active)
-  - **Package Management:** Standard `npm` with Node `v25.1.0`. Can also use `npx` for executing binaries such as the Supabase CLI (`npx supabase`).
+This revised specification incorporates an exhaustive security, multi-tenancy, and data-architecture audit conducted following the initial proposal. No application scaffolding or migrations have been executed; this document serves as the authoritative blueprint for Phase 1.
 
-### 1.2 Product Vision & Core Mission
-**PG Manager by The Layout Office** is an enterprise-grade, mobile-first Progressive Web Application (PWA) tailored specifically for the Indian Paying Guest (PG) and hostel ecosystem. It provides multi-tenant operations bridging three distinct user personas:
-1. **Owners:** Business oversight, room & bed inventory, financial health (rent collection vs. operational expenses), occupancy reports, and staff delegation.
-2. **Wardens:** Ground-level operations, physical bed vacancy checks, student/guest check-in & check-out, digital gate entry/exit register, and immediate complaint resolution.
-3. **Tenants:** Mobile-first dashboard for rent payments via UPI/cards, instant GST-compliant PDF receipts, transparent mess food schedules, maintenance ticket tracking, and gate pass management.
+### 1.1 Key Architectural Refinements in Version 2.0.0
+1. **Engine-Level Multi-Tenant Isolation:** Replaced single-column foreign keys with **Composite Foreign Keys** `(pg_id, id)` across all relational dependencies (rooms, beds, tenants, assignments, rent records, payments, allocations, complaints, gate logs). Cross-PG data corruption is now mathematically impossible at the database engine level.
+2. **Robust Double-Entry Style Payment Ledger:** Introduced `payment_allocations` to cleanly handle partial payments, advance payments, and single payments split across multiple rent periods. Implemented a strict **Payment Immutability Policy** backed by database triggers.
+3. **Webhook Deduplication & Idempotent Transactions:** Introduced `webhook_events` to deduplicate Razorpay webhook payloads. All financial mutations are now executed via PostgreSQL Stored Procedures (RPCs) with advisory locks, eliminating race conditions.
+4. **Flexible, Prorated Rent Billing:** Replaced simplistic monthly constraints with assignment-interval tracking (`assignment_id`, `period_start`, `period_end`). Added `rent_adjustments` for audited waivers, late fees, and utility charges.
+5. **Secure Authentication & Onboarding Workflow:** Designed an unforgeable tenant and staff invitation architecture utilizing `tenant_invitations` and `staff_invitations`. Account linking is mediated by a secure `SECURITY DEFINER` RPC that verifies `auth.users.phone` before binding profiles.
+6. **Data Privacy & Statutory Compliance (India DPDP Act 2023):** Removed mandatory Aadhaar collection. Replaced with data minimization (masked last 4 digits only or alternative IDs). Enforced private Supabase Storage buckets with short-lived signed URLs. Replaced false "GST-compliance" claims with customizable tax receipts based on actual PG GSTIN registration.
+7. **Reliable WhatsApp Notification Queue:** Introduced `notification_jobs` featuring exponential backoff, delivery status callbacks, template mappings, tenant opt-out flags, and message deduplication keys.
+8. **Finite-State Gate Management:** Redesigned gate logs to track full state transitions (`checked_in`, `checked_out`, `night_out_requested`, `late_entry`), powering targeted 10 PM alerts based on actual physical presence and PG-specific closing times.
 
 ---
 
-## 2. System Architecture & High-Level Design
+## 2. Multi-Tenant Isolation Strategy & Composite Foreign Keys
 
-```
-+---------------------------------------------------------------------------------------+
-|                                    CLIENT TIER                                        |
-|  Mobile / Tablet / Desktop Browser (Mobile-First PWA, Installable, Offline Cache)     |
-|  - Owner Portal  |  - Warden Portal  |  - Tenant Portal  |  - Shared Public/Auth      |
-+-------------------------------------------+-------------------------------------------+
-                                            | HTTPS / WSS
-                                            v
-+---------------------------------------------------------------------------------------+
-|                              EDGE / NEXT.JS APPLICATION LAYER                         |
-|  - App Router (React 19 / Server Components + Client Islands)                         |
-|  - Next.js Middleware (Role Guards, Multi-Tenant PG Context Switcher, Session Check)    |
-|  - Server Actions & Route Handlers (Zod Input Validation, Atomic Transactions)        |
-+-------------------+-------------------------------+-----------------------------------+
-                    |                               |
-       Postgres Wire / Supabase SDK                 | REST / Webhooks
-                    v                               v
-+-----------------------------------+   +-----------------------------------------------+
-|     SUPABASE BACKEND (PostgreSQL) |   |             EXTERNAL INTEGRATIONS             |
-| - Row Level Security (RLS)        |   | - Razorpay API & Webhooks (Payments & Orders) |
-| - Phone OTP Auth (E.164 +91)      |   | - WhatsApp Cloud API / BSP (WATI/Interakt)   |
-| - Storage Buckets (KYC, Receipts) |   | - Vercel Cron / pg_cron (Scheduled Jobs)      |
-| - pg_cron & pg_net (Automations)  |   | - Cloudflare Turnstile / Bot Mitigation       |
-+-----------------------------------+   +-----------------------------------------------+
-```
-
-### 2.1 Architectural Principles
-- **Strict Server-Enforced Security:** Zero reliance on client-side security checks. All authorization is backed by PostgreSQL Row Level Security (RLS) joined with tenant membership tables.
-- **Mobile-First Touch Ergonomics:** 90%+ of end users (tenants and wardens) will interact via low-to-mid range mobile devices on 4G/5G connections. Minimal JavaScript payload, system fonts or optimized font subsets, native-feeling drawer sheets, bottom navigation bars, and instant touch feedback.
-- **Idempotent Financial & Messaging Processing:** Webhooks from payment gateways (Razorpay) and messaging queues (WhatsApp) must be strictly idempotent to prevent double billing, duplicate receipts, or repeated notifications.
-- **Fail-Safe Third-Party Providers:** Decoupled service layer abstractions allowing seamless switching between WhatsApp BSPs (Interakt, WATI) or Meta's Direct WhatsApp Cloud API without altering business logic.
-
----
-
-## 3. Multi-Tenant Isolation & Security Strategy
-
-Multi-tenancy in PG Manager is architected at the database row level with membership-based Row Level Security (RLS). Every operational business record belongs to a specific PG business (`pg_id`).
-
-### 3.1 Tenancy Hierarchy
-```
-[Platform Account / Super Admin]
-        |
-        v
-    [pgs] (Independent PG Businesses / Properties)
-        |
-        +---> [pg_members] (User-to-PG Role Mapping: owner, warden, tenant)
-        |           |
-        |           v
-        |      [user_profiles] (Linked 1-to-1 with Supabase auth.users)
-        |
-        +---> [rooms] ---> [beds] ---> [tenant_bed_assignments]
-        +---> [tenants]
-        +---> [rent_records] ---> [payments]
-        +---> [complaints]
-        +---> [expenses]
-        +---> [gate_logs]
-        +---> [mess_menu]
-        +---> [whatsapp_message_logs]
-```
-
-### 3.2 Row Level Security (RLS) Architecture
-Every table has RLS explicitly enabled:
+### 2.1 The Cross-Tenant Reference Vulnerability (And Its Engine-Level Fix)
+In conventional multi-tenant schemas relying solely on single-column foreign keys, every table contains a `pg_id` column, but child tables reference parent tables by `id` alone:
 ```sql
-ALTER TABLE pgs ENABLE ROW LEVEL SECURITY;
-ALTER TABLE pg_members ENABLE ROW LEVEL SECURITY;
-ALTER TABLE rooms ENABLE ROW LEVEL SECURITY;
-ALTER TABLE beds ENABLE ROW LEVEL SECURITY;
-ALTER TABLE tenants ENABLE ROW LEVEL SECURITY;
-ALTER TABLE tenant_bed_assignments ENABLE ROW LEVEL SECURITY;
-ALTER TABLE rent_records ENABLE ROW LEVEL SECURITY;
-ALTER TABLE payments ENABLE ROW LEVEL SECURITY;
-ALTER TABLE complaints ENABLE ROW LEVEL SECURITY;
-ALTER TABLE expenses ENABLE ROW LEVEL SECURITY;
-ALTER TABLE gate_logs ENABLE ROW LEVEL SECURITY;
-ALTER TABLE mess_menu ENABLE ROW LEVEL SECURITY;
-ALTER TABLE whatsapp_message_logs ENABLE ROW LEVEL SECURITY;
-ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
+-- VULNERABLE PATTERN:
+CREATE TABLE beds (
+    id UUID PRIMARY KEY,
+    pg_id UUID NOT NULL,
+    room_id UUID REFERENCES rooms(id) -- room_id could belong to a completely different PG!
+);
 ```
+Under this flawed pattern, an application-layer bug or rogue API call could assign a room from **PG Alpha** to a bed in **PG Beta**, causing catastrophic data leakage across business accounts.
 
-#### Database Helper Functions (Security Definer)
-To prevent recursive policy checks and maximize query planner performance:
-1. `public.get_auth_user_role(target_pg_id UUID)`: Returns `'owner'`, `'warden'`, `'tenant'`, or `NULL` by checking `pg_members`.
-2. `public.is_pg_owner(target_pg_id UUID)`: Returns `BOOLEAN`.
-3. `public.is_pg_staff(target_pg_id UUID)`: Returns `TRUE` if user is either `'owner'` or `'warden'`.
-4. `public.get_tenant_record_id(target_pg_id UUID)`: Returns the `tenants.id` corresponding to `auth.uid()` in that PG.
+### 2.2 The Solution: Composite Foreign Keys
+Every tenant-scoped table enforces a composite unique constraint `UNIQUE (pg_id, id)`. All child relationships must reference **both** `pg_id` and the primary key:
+```sql
+-- ENGINE-ENFORCED IMMUNITY:
+CREATE TABLE rooms (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pg_id UUID NOT NULL REFERENCES pgs(id) ON DELETE CASCADE,
+    ...,
+    CONSTRAINT uq_rooms_pg_id UNIQUE (pg_id, id)
+);
 
-#### Example RLS Policy Matrix
-| Table | Owner Access | Warden Access | Tenant Access |
-|---|---|---|---|
-| `pgs` | Full CRUD on own PG | Read-only for assigned PG | Read-only (basic info: name, address, rules) |
-| `rooms` & `beds` | Full CRUD | Read & Update status (vacant/occupied/cleaning) | Read-only (own room/bed details) |
-| `tenants` | Full CRUD | Read all, Create/Update tenant KYC | Read/Update own personal profile |
-| `rent_records` | Full CRUD | Read-only | Read-only for own rent records |
-| `payments` | Full CRUD (including manual cash entry) | Read & record cash payments (if permitted) | Read own payment history & initiate online pay |
-| `complaints` | Full CRUD | View all, update status & resolution notes | View own, create new, submit feedback rating |
-| `expenses` | Full CRUD | Create (daily petty cash), Read assigned | No access |
-| `gate_logs` | Full CRUD | Full CRUD (log check-in/out, verify entries) | Read own logs, submit leave/night-out request |
-| `mess_menu` | Full CRUD | Full CRUD | Read-only |
-| `whatsapp_logs`| Read-only | No access | No access |
+CREATE TABLE beds (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pg_id UUID NOT NULL REFERENCES pgs(id) ON DELETE CASCADE,
+    room_id UUID NOT NULL,
+    ...,
+    CONSTRAINT uq_beds_pg_id UNIQUE (pg_id, id),
+    CONSTRAINT fk_beds_room_composite FOREIGN KEY (pg_id, room_id) 
+        REFERENCES rooms(pg_id, id) ON DELETE CASCADE
+);
+```
+With composite foreign keys, PostgreSQL's relational engine rejects any insert or update where the child's `pg_id` does not match the parent's `pg_id`.
+
+### 2.3 Composite Foreign Key Dependency Graph
+```
+[pgs (id)]
+   |
+   +---> [rooms (pg_id, id)] <---------------+
+   |        |                                |
+   |        +---> [beds (pg_id, id)] <----+  |
+   |                                      |  |
+   +---> [tenants (pg_id, id)] <-------+  |  |
+   |        |                          |  |  |
+   |        +---> [tenant_bed_assignments (pg_id, id)]
+   |                 |                 |
+   |                 +---> [rent_records (pg_id, id)] <---------+
+   |                          |                                 |
+   |                          +---> [rent_adjustments (pg_id, id)]
+   |                                                            |
+   +---> [payments (pg_id, id)]                                 |
+   |        |                                                   |
+   |        +---> [payment_allocations (pg_id, id)] ------------+
+   |
+   +---> [complaints (pg_id, id)] (references tenants(pg_id, id) & rooms(pg_id, id))
+   +---> [gate_logs (pg_id, id)] (references tenants(pg_id, id))
+   +---> [inquiries (pg_id, id)]
+   +---> [tenant_invitations (pg_id, id)] (references tenants(pg_id, id))
+   +---> [notification_jobs (pg_id, id)]
+```
 
 ---
 
-## 4. Comprehensive Database Schema Design
+## 3. Redesigned Row Level Security (RLS) Architecture
 
-All tables utilize UUID primary keys (`gen_random_uuid()`), automatic timestamp triggers (`created_at`, `updated_at`), foreign keys with explicit cascade/restrict rules, check constraints, and performance indexes.
+### 3.1 Avoiding RLS Recursion
+**The Infinite Recursion Problem:** If a policy on `pg_members` queries `pg_members` to verify user permissions, or if `rooms` queries `pg_members` which triggers its own RLS policy, PostgreSQL either aborts with an infinite recursion error or incurs severe performance degradation.
 
-### 4.1 Schema Definitions (PostgreSQL DDL Reference)
+**The Solution:**
+1. Database helper functions are created with `SECURITY DEFINER` and execute with the privileges of the database owner, bypassing RLS internally on `pg_members`.
+2. Safe fixed `search_path` is explicitly declared: `SET search_path = public, auth, pg_temp;`.
+3. Execution permissions are tightly controlled: revoked from `PUBLIC` and granted strictly to `authenticated`.
+4. The helper functions never trust user-supplied parameters for identity; they extract identity strictly from `auth.uid()`.
 
 ```sql
--- 1. USER PROFILES (1-to-1 with Supabase auth.users)
+-- Core Security Definer Helper: Role Lookup
+CREATE OR REPLACE FUNCTION public.get_auth_user_role(target_pg_id UUID)
+RETURNS TEXT
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public, auth, pg_temp
+AS $$
+    SELECT role FROM public.pg_members
+    WHERE pg_id = target_pg_id
+      AND user_id = auth.uid()
+      AND status = 'active'
+    LIMIT 1;
+$$;
+
+-- Core Security Definer Helper: Tenant ID Lookup
+CREATE OR REPLACE FUNCTION public.get_auth_tenant_id(target_pg_id UUID)
+RETURNS UUID
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public, auth, pg_temp
+AS $$
+    SELECT id FROM public.tenants
+    WHERE pg_id = target_pg_id
+      AND user_id = auth.uid()
+      AND status = 'active'
+    LIMIT 1;
+$$;
+
+REVOKE ALL ON FUNCTION public.get_auth_user_role(UUID) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.get_auth_user_role(UUID) TO authenticated;
+
+REVOKE ALL ON FUNCTION public.get_auth_tenant_id(UUID) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.get_auth_tenant_id(UUID) TO authenticated;
+```
+
+### 3.2 Secure Initial Owner Onboarding Flow
+**The Vulnerability:** If regular authenticated users have direct `INSERT` permissions on `pg_members` or `pgs`, malicious actors could inject themselves as owners of existing businesses or grant themselves unauthorized administrative privileges.
+
+**The Architectural Solution:**
+1. Direct `INSERT` on `pg_members` and `pgs` is completely disabled for regular client roles (`authenticated`).
+2. New PG creation is executed strictly through a PostgreSQL `SECURITY DEFINER` RPC: `public.create_new_pg_business(...)`.
+
+```sql
+CREATE OR REPLACE FUNCTION public.create_new_pg_business(
+    p_name TEXT,
+    p_slug TEXT,
+    p_address_line1 TEXT,
+    p_city TEXT,
+    p_state TEXT,
+    p_pincode TEXT,
+    p_contact_phone TEXT,
+    p_gender_type TEXT
+)
+RETURNS UUID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, auth, pg_temp
+AS $$
+DECLARE
+    v_user_id UUID;
+    v_pg_id UUID;
+BEGIN
+    v_user_id := auth.uid();
+    IF v_user_id IS NULL THEN
+        RAISE EXCEPTION 'Authentication required.';
+    END IF;
+
+    -- Validate input constraints
+    IF LENGTH(TRIM(p_name)) < 3 THEN
+        RAISE EXCEPTION 'PG name must be at least 3 characters.';
+    END IF;
+
+    -- Insert PG record
+    INSERT INTO public.pgs (
+        name, slug, address_line1, city, state, pincode, contact_phone, gender_type
+    ) VALUES (
+        p_name, LOWER(TRIM(p_slug)), p_address_line1, p_city, p_state, p_pincode, p_contact_phone, p_gender_type
+    ) RETURNING id INTO v_pg_id;
+
+    -- Automatically assign creator as owner
+    INSERT INTO public.pg_members (
+        pg_id, user_id, role, status
+    ) VALUES (
+        v_pg_id, v_user_id, 'owner', 'active'
+    );
+
+    -- Log action
+    INSERT INTO public.audit_logs (
+        pg_id, actor_user_id, action, entity_type, entity_id, details
+    ) VALUES (
+        v_pg_id, v_user_id, 'PG_CREATED', 'pgs', v_pg_id, jsonb_build_object('name', p_name, 'slug', p_slug)
+    );
+
+    RETURN v_pg_id;
+END;
+$$;
+```
+
+### 3.3 Complete RLS Policy Matrix
+
+All policies evaluate against `public.get_auth_user_role(pg_id)`. Next.js Middleware routes provide UI convenience, but the database enforces complete isolation.
+
+| Table | SELECT Policy | INSERT Policy | UPDATE Policy | DELETE Policy |
+|---|---|---|---|---|
+| `pgs` | User is active member of `id` (`get_auth_user_role(id) IS NOT NULL`) | Blocked (Use `create_new_pg_business` RPC) | Role = `'owner'` | Role = `'owner'` |
+| `pg_members` | User is member of `pg_id` | Role = `'owner'` | Role = `'owner'` (Cannot demote last owner) | Role = `'owner'` |
+| `rooms` | Active member of `pg_id` | Role = `'owner'` | Role IN (`'owner'`, `'warden'`) | Role = `'owner'` |
+| `beds` | Active member of `pg_id` | Role = `'owner'` | Role IN (`'owner'`, `'warden'`) | Role = `'owner'` |
+| `tenants` | Staff (`'owner'`, `'warden'`) OR self (`id = get_auth_tenant_id(pg_id)`) | Role IN (`'owner'`, `'warden'`) | Staff for all; Tenant for own contact info | Role = `'owner'` |
+| `tenant_bed_assignments` | Staff OR self (`tenant_id = get_auth_tenant_id(pg_id)`) | Role IN (`'owner'`, `'warden'`) | Role IN (`'owner'`, `'warden'`) | Role = `'owner'` |
+| `rent_records` | Staff OR self (`tenant_id = get_auth_tenant_id(pg_id)`) | Role = `'owner'` OR System RPC | Role = `'owner'` OR System RPC | Role = `'owner'` |
+| `rent_adjustments` | Staff OR self (`tenant_id = get_auth_tenant_id(pg_id)`) | Role = `'owner'` | Blocked (Immutable Audit Record) | Blocked |
+| `payments` | Staff OR self (`tenant_id = get_auth_tenant_id(pg_id)`) | Staff (Cash) OR Verified Razorpay RPC | Blocked once `payment_status = 'successful'` | Blocked |
+| `payment_allocations` | Staff OR self (via payment/rent ownership) | Verified RPC or Owner | Blocked (Immutable) | Blocked |
+| `complaints` | Staff OR self (`tenant_id = get_auth_tenant_id(pg_id)`) | Tenant (own `tenant_id`) OR Staff | Staff can update status; Tenant can rate | Role = `'owner'` |
+| `complaint_status_history`| Staff OR complaint owner | System Trigger / RPC | Blocked (Immutable) | Blocked |
+| `expenses` | Role = `'owner'` OR Staff (petty cash) | Role IN (`'owner'`, `'warden'`) | Role = `'owner'` | Role = `'owner'` |
+| `gate_logs` | Staff OR self (`tenant_id = get_auth_tenant_id(pg_id)`) | Staff OR Tenant (check-out/night-out) | Staff (verify entry / actual return) | Role = `'owner'` |
+| `inquiries` | Role IN (`'owner'`, `'warden'`) | Staff OR Public RPC (Web/WhatsApp lead) | Role IN (`'owner'`, `'warden'`) | Role = `'owner'` |
+| `notification_jobs` | Role = `'owner'` | System Triggers / Background Service | System Worker | System Worker |
+| `webhook_events` | Blocked from all client access | Service Role Key Only | Service Role Key Only | Service Role Key Only |
+
+---
+
+## 4. Comprehensive Database Schema (PostgreSQL DDL)
+
+### 4.1 Schema Definition with Composite Integrity Constraints
+
+```sql
+-- 1. USER PROFILES (1-to-1 with auth.users)
 CREATE TABLE public.user_profiles (
     id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
-    phone TEXT NOT NULL UNIQUE,
+    phone VARCHAR(15) NOT NULL UNIQUE,
     full_name TEXT NOT NULL,
     email TEXT,
     avatar_url TEXT,
@@ -151,7 +244,7 @@ CREATE TABLE public.user_profiles (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 2. PGS (PG Business / Property)
+-- 2. PGS (Multi-Tenant Properties)
 CREATE TABLE public.pgs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name TEXT NOT NULL,
@@ -165,6 +258,8 @@ CREATE TABLE public.pgs (
     contact_email TEXT,
     gender_type TEXT NOT NULL CHECK (gender_type IN ('boys', 'girls', 'coed')),
     gate_closing_time TIME NOT NULL DEFAULT '22:00:00',
+    gstin VARCHAR(15), -- Optional: for tax-registered PGs
+    pan_number VARCHAR(10),
     rules_and_regulations TEXT,
     bank_upi_id TEXT,
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
@@ -172,7 +267,7 @@ CREATE TABLE public.pgs (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 3. PG MEMBERS (Role-Based Membership & Multi-Tenancy Anchor)
+-- 3. PG MEMBERS (Role Mapping)
 CREATE TABLE public.pg_members (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pg_id UUID NOT NULL REFERENCES public.pgs(id) ON DELETE CASCADE,
@@ -182,7 +277,7 @@ CREATE TABLE public.pg_members (
     permissions JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(pg_id, user_id)
+    CONSTRAINT uq_pg_members UNIQUE (pg_id, user_id)
 );
 
 -- 4. ROOMS
@@ -199,23 +294,27 @@ CREATE TABLE public.rooms (
     status TEXT NOT NULL DEFAULT 'available' CHECK (status IN ('available', 'maintenance', 'full')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(pg_id, room_number)
+    CONSTRAINT uq_rooms_pg_id UNIQUE (pg_id, id),
+    CONSTRAINT uq_rooms_number UNIQUE (pg_id, room_number)
 );
 
 -- 5. BEDS
 CREATE TABLE public.beds (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pg_id UUID NOT NULL REFERENCES public.pgs(id) ON DELETE CASCADE,
-    room_id UUID NOT NULL REFERENCES public.rooms(id) ON DELETE CASCADE,
-    bed_label VARCHAR(20) NOT NULL, -- e.g. "Bed 1", "Bed A", "Window Side"
+    room_id UUID NOT NULL,
+    bed_label VARCHAR(20) NOT NULL,
     monthly_rent NUMERIC(10, 2) NOT NULL CHECK (monthly_rent >= 0),
     status TEXT NOT NULL DEFAULT 'vacant' CHECK (status IN ('vacant', 'occupied', 'reserved', 'maintenance')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(room_id, bed_label)
+    CONSTRAINT uq_beds_pg_id UNIQUE (pg_id, id),
+    CONSTRAINT uq_beds_room_label UNIQUE (room_id, bed_label),
+    CONSTRAINT fk_beds_room_composite FOREIGN KEY (pg_id, room_id) 
+        REFERENCES public.rooms(pg_id, id) ON DELETE CASCADE
 );
 
--- 6. TENANTS (Tenant Identity & KYC Profile)
+-- 6. TENANTS (Minimizing KYC Data - No Full Aadhaar)
 CREATE TABLE public.tenants (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pg_id UUID NOT NULL REFERENCES public.pgs(id) ON DELETE CASCADE,
@@ -223,29 +322,31 @@ CREATE TABLE public.tenants (
     full_name TEXT NOT NULL,
     phone VARCHAR(15) NOT NULL,
     email TEXT,
-    alternate_phone VARCHAR(15),
-    id_proof_type TEXT NOT NULL CHECK (id_proof_type IN ('aadhaar', 'pan', 'driving_license', 'passport', 'voter_id', 'college_id', 'other')),
-    id_proof_number TEXT,
-    id_proof_document_url TEXT,
-    photo_url TEXT,
+    id_proof_type TEXT NOT NULL CHECK (id_proof_type IN ('college_id', 'work_id', 'driving_license', 'passport', 'voter_id', 'masked_aadhaar', 'other')),
+    id_proof_last_four VARCHAR(4), -- Strictly last 4 digits for privacy compliance
+    id_document_storage_path TEXT, -- Secure private Supabase bucket path
+    photo_storage_path TEXT,
     permanent_address TEXT,
     emergency_contact_name TEXT NOT NULL,
     emergency_contact_phone VARCHAR(15) NOT NULL,
     emergency_contact_relation TEXT NOT NULL,
-    work_or_college_details TEXT,
+    employer_or_college TEXT,
     security_deposit_amount NUMERIC(10, 2) NOT NULL DEFAULT 0.00 CHECK (security_deposit_amount >= 0),
     security_deposit_status TEXT NOT NULL DEFAULT 'pending' CHECK (security_deposit_status IN ('pending', 'paid', 'partially_refunded', 'refunded', 'forfeited')),
+    whatsapp_opt_out BOOLEAN NOT NULL DEFAULT FALSE,
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'notice_period', 'vacated', 'blacklisted')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_tenants_pg_id UNIQUE (pg_id, id),
+    CONSTRAINT uq_tenants_pg_phone UNIQUE (pg_id, phone)
 );
 
--- 7. TENANT BED ASSIGNMENTS (History & Active Stays)
+-- 7. TENANT BED ASSIGNMENTS
 CREATE TABLE public.tenant_bed_assignments (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pg_id UUID NOT NULL REFERENCES public.pgs(id) ON DELETE CASCADE,
-    tenant_id UUID NOT NULL REFERENCES public.tenants(id) ON DELETE CASCADE,
-    bed_id UUID NOT NULL REFERENCES public.beds(id) ON DELETE RESTRICT,
+    tenant_id UUID NOT NULL,
+    bed_id UUID NOT NULL,
     agreed_monthly_rent NUMERIC(10, 2) NOT NULL CHECK (agreed_monthly_rent >= 0),
     assigned_from DATE NOT NULL,
     assigned_to DATE,
@@ -253,16 +354,23 @@ CREATE TABLE public.tenant_bed_assignments (
     vacating_date DATE,
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_assignments_pg_id UNIQUE (pg_id, id),
+    CONSTRAINT fk_assignments_tenant_composite FOREIGN KEY (pg_id, tenant_id)
+        REFERENCES public.tenants(pg_id, id) ON DELETE CASCADE,
+    CONSTRAINT fk_assignments_bed_composite FOREIGN KEY (pg_id, bed_id)
+        REFERENCES public.beds(pg_id, id) ON DELETE RESTRICT
 );
 
--- 8. RENT RECORDS (Monthly Billing Ledger)
+-- 8. RENT RECORDS (Billing Interval Ledger)
 CREATE TABLE public.rent_records (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pg_id UUID NOT NULL REFERENCES public.pgs(id) ON DELETE CASCADE,
-    tenant_id UUID NOT NULL REFERENCES public.tenants(id) ON DELETE CASCADE,
-    assignment_id UUID REFERENCES public.tenant_bed_assignments(id) ON DELETE SET NULL,
-    billing_month DATE NOT NULL, -- Stored as first of month, e.g. 2026-11-01
+    tenant_id UUID NOT NULL,
+    assignment_id UUID NOT NULL,
+    billing_month DATE NOT NULL, -- Anchor date: 1st of calendar month (e.g. 2026-11-01)
+    period_start DATE NOT NULL,
+    period_end DATE NOT NULL,
     due_date DATE NOT NULL,
     base_rent_amount NUMERIC(10, 2) NOT NULL CHECK (base_rent_amount >= 0),
     utility_charges NUMERIC(10, 2) NOT NULL DEFAULT 0.00 CHECK (utility_charges >= 0),
@@ -275,15 +383,35 @@ CREATE TABLE public.rent_records (
     generated_by TEXT NOT NULL DEFAULT 'system' CHECK (generated_by IN ('system', 'manual')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(tenant_id, billing_month)
+    CONSTRAINT uq_rent_records_pg_id UNIQUE (pg_id, id),
+    CONSTRAINT uq_rent_records_assignment_period UNIQUE (assignment_id, period_start, period_end),
+    CONSTRAINT chk_rent_period_valid CHECK (period_start <= period_end),
+    CONSTRAINT fk_rent_tenant_composite FOREIGN KEY (pg_id, tenant_id)
+        REFERENCES public.tenants(pg_id, id) ON DELETE CASCADE,
+    CONSTRAINT fk_rent_assignment_composite FOREIGN KEY (pg_id, assignment_id)
+        REFERENCES public.tenant_bed_assignments(pg_id, id) ON DELETE RESTRICT
 );
 
--- 9. PAYMENTS (Transactions: Razorpay, UPI, Cash)
+-- 9. RENT ADJUSTMENTS (Formal Audited Alterations)
+CREATE TABLE public.rent_adjustments (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pg_id UUID NOT NULL REFERENCES public.pgs(id) ON DELETE CASCADE,
+    rent_record_id UUID NOT NULL,
+    adjustment_type TEXT NOT NULL CHECK (adjustment_type IN ('waiver', 'discount', 'late_fee_addition', 'utility_meter', 'damage_penalty', 'correction')),
+    amount NUMERIC(10, 2) NOT NULL, -- Positive adds to bill, negative discounts
+    reason TEXT NOT NULL,
+    authorized_by_user_id UUID NOT NULL REFERENCES public.user_profiles(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_rent_adjustments_pg_id UNIQUE (pg_id, id),
+    CONSTRAINT fk_adjustments_rent_composite FOREIGN KEY (pg_id, rent_record_id)
+        REFERENCES public.rent_records(pg_id, id) ON DELETE CASCADE
+);
+
+-- 10. PAYMENTS (Transactions: Cash & Razorpay)
 CREATE TABLE public.payments (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pg_id UUID NOT NULL REFERENCES public.pgs(id) ON DELETE CASCADE,
-    rent_record_id UUID REFERENCES public.rent_records(id) ON DELETE SET NULL,
-    tenant_id UUID NOT NULL REFERENCES public.tenants(id) ON DELETE CASCADE,
+    tenant_id UUID NOT NULL,
     amount NUMERIC(10, 2) NOT NULL CHECK (amount > 0),
     payment_method TEXT NOT NULL CHECK (payment_method IN ('razorpay_upi', 'razorpay_card', 'razorpay_netbanking', 'cash', 'direct_upi_qr', 'bank_transfer')),
     payment_status TEXT NOT NULL DEFAULT 'pending' CHECK (payment_status IN ('pending', 'successful', 'failed', 'refunded')),
@@ -291,35 +419,86 @@ CREATE TABLE public.payments (
     razorpay_payment_id TEXT UNIQUE,
     razorpay_signature TEXT,
     receipt_number VARCHAR(50) NOT NULL UNIQUE,
-    receipt_pdf_url TEXT,
-    recorded_by_user_id UUID REFERENCES public.user_profiles(id) ON DELETE SET NULL,
+    receipt_pdf_path TEXT,
+    recorded_by_user_id UUID REFERENCES public.user_profiles(id),
     notes TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_payments_pg_id UNIQUE (pg_id, id),
+    CONSTRAINT fk_payments_tenant_composite FOREIGN KEY (pg_id, tenant_id)
+        REFERENCES public.tenants(pg_id, id) ON DELETE CASCADE
 );
 
--- 10. COMPLAINTS (Maintenance & Service Desk)
+-- 11. PAYMENT ALLOCATIONS (Double-Entry Allocation to Rent Records)
+CREATE TABLE public.payment_allocations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pg_id UUID NOT NULL REFERENCES public.pgs(id) ON DELETE CASCADE,
+    payment_id UUID NOT NULL,
+    rent_record_id UUID NOT NULL,
+    allocated_amount NUMERIC(10, 2) NOT NULL CHECK (allocated_amount > 0),
+    allocated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_payment_allocations_pg_id UNIQUE (pg_id, id),
+    CONSTRAINT fk_allocations_payment_composite FOREIGN KEY (pg_id, payment_id)
+        REFERENCES public.payments(pg_id, id) ON DELETE CASCADE,
+    CONSTRAINT fk_allocations_rent_composite FOREIGN KEY (pg_id, rent_record_id)
+        REFERENCES public.rent_records(pg_id, id) ON DELETE RESTRICT
+);
+
+-- 12. WEBHOOK EVENTS (Idempotent Razorpay Tracking)
+CREATE TABLE public.webhook_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    provider TEXT NOT NULL DEFAULT 'razorpay',
+    event_id TEXT NOT NULL UNIQUE,
+    event_type TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    signature TEXT NOT NULL,
+    processing_status TEXT NOT NULL DEFAULT 'pending' CHECK (processing_status IN ('pending', 'processed', 'failed', 'ignored')),
+    error_message TEXT,
+    processed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 13. COMPLAINTS
 CREATE TABLE public.complaints (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pg_id UUID NOT NULL REFERENCES public.pgs(id) ON DELETE CASCADE,
-    tenant_id UUID NOT NULL REFERENCES public.tenants(id) ON DELETE CASCADE,
-    room_id UUID REFERENCES public.rooms(id) ON DELETE SET NULL,
+    tenant_id UUID NOT NULL,
+    room_id UUID,
     category TEXT NOT NULL CHECK (category IN ('plumbing', 'electrical', 'carpentry', 'cleaning', 'wifi', 'food', 'noise_disturbance', 'security', 'other')),
     title VARCHAR(150) NOT NULL,
     description TEXT NOT NULL,
-    photo_urls TEXT[] NOT NULL DEFAULT '{}',
+    photo_storage_paths TEXT[] NOT NULL DEFAULT '{}',
     priority TEXT NOT NULL DEFAULT 'medium' CHECK (priority IN ('low', 'medium', 'high', 'urgent')),
     status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'in_progress', 'resolved', 'closed', 'rejected')),
-    assigned_to_user_id UUID REFERENCES public.user_profiles(id) ON DELETE SET NULL,
+    assigned_to_user_id UUID REFERENCES public.user_profiles(id),
     resolution_notes TEXT,
     resolved_at TIMESTAMPTZ,
     tenant_feedback_rating INT CHECK (tenant_feedback_rating BETWEEN 1 AND 5),
     tenant_feedback_comment TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_complaints_pg_id UNIQUE (pg_id, id),
+    CONSTRAINT fk_complaints_tenant_composite FOREIGN KEY (pg_id, tenant_id)
+        REFERENCES public.tenants(pg_id, id) ON DELETE CASCADE,
+    CONSTRAINT fk_complaints_room_composite FOREIGN KEY (pg_id, room_id)
+        REFERENCES public.rooms(pg_id, id) ON DELETE SET NULL
 );
 
--- 11. EXPENSES (Operational Cost Ledger)
+-- 14. COMPLAINT STATUS HISTORY
+CREATE TABLE public.complaint_status_history (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pg_id UUID NOT NULL REFERENCES public.pgs(id) ON DELETE CASCADE,
+    complaint_id UUID NOT NULL,
+    from_status TEXT,
+    to_status TEXT NOT NULL,
+    changed_by_user_id UUID NOT NULL REFERENCES public.user_profiles(id),
+    notes TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_complaint_history_composite FOREIGN KEY (pg_id, complaint_id)
+        REFERENCES public.complaints(pg_id, id) ON DELETE CASCADE
+);
+
+-- 15. EXPENSES
 CREATE TABLE public.expenses (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pg_id UUID NOT NULL REFERENCES public.pgs(id) ON DELETE CASCADE,
@@ -328,18 +507,19 @@ CREATE TABLE public.expenses (
     amount NUMERIC(10, 2) NOT NULL CHECK (amount > 0),
     expense_date DATE NOT NULL,
     payment_mode TEXT NOT NULL CHECK (payment_mode IN ('cash', 'upi', 'bank_transfer', 'credit_card', 'cheque')),
-    receipt_attachment_url TEXT,
+    receipt_storage_path TEXT,
     vendor_name VARCHAR(150),
     recorded_by_user_id UUID NOT NULL REFERENCES public.user_profiles(id),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_expenses_pg_id UNIQUE (pg_id, id)
 );
 
--- 12. GATE LOGS (Entry & Exit Register)
+-- 16. GATE LOGS (Finite State Tracking)
 CREATE TABLE public.gate_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pg_id UUID NOT NULL REFERENCES public.pgs(id) ON DELETE CASCADE,
-    tenant_id UUID NOT NULL REFERENCES public.tenants(id) ON DELETE CASCADE,
+    tenant_id UUID NOT NULL,
     entry_type TEXT NOT NULL CHECK (entry_type IN ('check_out', 'check_in', 'night_out_request', 'late_entry')),
     logged_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     expected_return_at TIMESTAMPTZ,
@@ -348,14 +528,38 @@ CREATE TABLE public.gate_logs (
     is_late_entry BOOLEAN NOT NULL DEFAULT FALSE,
     verified_by_user_id UUID REFERENCES public.user_profiles(id),
     notes TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_gate_logs_pg_id UNIQUE (pg_id, id),
+    CONSTRAINT fk_gate_logs_tenant_composite FOREIGN KEY (pg_id, tenant_id)
+        REFERENCES public.tenants(pg_id, id) ON DELETE CASCADE
 );
 
--- 13. MESS MENU (Weekly Food Schedule)
+-- 17. INQUIRIES (Prospective Leads Pipeline)
+CREATE TABLE public.inquiries (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pg_id UUID NOT NULL REFERENCES public.pgs(id) ON DELETE CASCADE,
+    prospect_name TEXT NOT NULL,
+    phone VARCHAR(15) NOT NULL,
+    email TEXT,
+    desired_room_type TEXT CHECK (desired_room_type IN ('single', 'double', 'triple', 'four_sharing', 'dormitory')),
+    expected_joining_date DATE,
+    budget NUMERIC(10, 2),
+    source TEXT NOT NULL DEFAULT 'whatsapp_inquiry' CHECK (source IN ('whatsapp_inquiry', 'website', 'walk_in', 'referral', 'portal')),
+    status TEXT NOT NULL DEFAULT 'new' CHECK (status IN ('new', 'contacted', 'visit_scheduled', 'converted', 'dropped')),
+    notes TEXT,
+    converted_tenant_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_inquiries_pg_id UNIQUE (pg_id, id),
+    CONSTRAINT fk_inquiries_converted_tenant FOREIGN KEY (pg_id, converted_tenant_id)
+        REFERENCES public.tenants(pg_id, id) ON DELETE SET NULL
+);
+
+-- 18. MESS MENU
 CREATE TABLE public.mess_menu (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pg_id UUID NOT NULL REFERENCES public.pgs(id) ON DELETE CASCADE,
-    day_of_week INT NOT NULL CHECK (day_of_week BETWEEN 0 AND 6), -- 0 = Sunday ... 6 = Saturday
+    day_of_week INT NOT NULL CHECK (day_of_week BETWEEN 0 AND 6),
     meal_type TEXT NOT NULL CHECK (meal_type IN ('breakfast', 'lunch', 'evening_snacks', 'dinner')),
     menu_items TEXT NOT NULL,
     start_time TIME NOT NULL,
@@ -364,28 +568,60 @@ CREATE TABLE public.mess_menu (
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(pg_id, day_of_week, meal_type)
+    CONSTRAINT uq_mess_menu_schedule UNIQUE (pg_id, day_of_week, meal_type)
 );
 
--- 14. WHATSAPP MESSAGE LOGS (Notification Audit & Retries)
-CREATE TABLE public.whatsapp_message_logs (
+-- 19. NOTIFICATION JOBS (Reliable Message Queue)
+CREATE TABLE public.notification_jobs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pg_id UUID NOT NULL REFERENCES public.pgs(id) ON DELETE CASCADE,
+    channel TEXT NOT NULL DEFAULT 'whatsapp' CHECK (channel IN ('whatsapp', 'sms')),
     recipient_phone VARCHAR(15) NOT NULL,
-    recipient_user_id UUID REFERENCES public.user_profiles(id) ON DELETE SET NULL,
-    message_type TEXT NOT NULL CHECK (message_type IN ('rent_reminder', 'payment_receipt', 'complaint_update', 'gate_closing_reminder', 'inquiry_response', 'custom_broadcast')),
     template_name VARCHAR(100) NOT NULL,
     template_variables JSONB NOT NULL DEFAULT '{}'::jsonb,
+    idempotency_key VARCHAR(150) NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'processing', 'sent', 'delivered', 'failed', 'dead_letter')),
+    attempts INT NOT NULL DEFAULT 0,
+    max_attempts INT NOT NULL DEFAULT 5,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     provider_message_id TEXT,
-    delivery_status TEXT NOT NULL DEFAULT 'queued' CHECK (delivery_status IN ('queued', 'sent', 'delivered', 'read', 'failed')),
-    error_message TEXT,
-    retry_count INT NOT NULL DEFAULT 0,
+    last_error TEXT,
     sent_at TIMESTAMPTZ,
+    delivered_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_notification_jobs_pg_id UNIQUE (pg_id, id)
 );
 
--- 15. AUDIT LOGS (Security & Compliance Ledger)
+-- 20. TENANT INVITATIONS (Secure Account-Linking Tokens)
+CREATE TABLE public.tenant_invitations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pg_id UUID NOT NULL REFERENCES public.pgs(id) ON DELETE CASCADE,
+    tenant_id UUID NOT NULL,
+    phone VARCHAR(15) NOT NULL,
+    token TEXT NOT NULL UNIQUE,
+    expires_at TIMESTAMPTZ NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'accepted', 'expired', 'revoked')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_tenant_invitations_pg_id UNIQUE (pg_id, id),
+    CONSTRAINT fk_invitations_tenant_composite FOREIGN KEY (pg_id, tenant_id)
+        REFERENCES public.tenants(pg_id, id) ON DELETE CASCADE
+);
+
+-- 21. STAFF INVITATIONS (Warden & Co-Owner Invitations)
+CREATE TABLE public.staff_invitations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pg_id UUID NOT NULL REFERENCES public.pgs(id) ON DELETE CASCADE,
+    email_or_phone VARCHAR(100) NOT NULL,
+    designated_role TEXT NOT NULL CHECK (designated_role IN ('warden', 'owner')),
+    token TEXT NOT NULL UNIQUE,
+    expires_at TIMESTAMPTZ NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'accepted', 'expired', 'revoked')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_staff_invitations_pg_id UNIQUE (pg_id, id)
+);
+
+-- 22. AUDIT LOGS
 CREATE TABLE public.audit_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pg_id UUID REFERENCES public.pgs(id) ON DELETE CASCADE,
@@ -395,412 +631,354 @@ CREATE TABLE public.audit_logs (
     entity_id UUID NOT NULL,
     details JSONB NOT NULL DEFAULT '{}'::jsonb,
     ip_address TEXT,
-    user_agent TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 16. SUBSCRIPTIONS (Platform SaaS Billing & Multi-PG Onboarding)
-CREATE TABLE public.pg_subscriptions (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    pg_id UUID NOT NULL REFERENCES public.pgs(id) ON DELETE CASCADE,
-    plan_tier TEXT NOT NULL CHECK (plan_tier IN ('trial', 'starter', 'growth', 'enterprise')),
-    max_beds INT NOT NULL DEFAULT 20,
-    billing_cycle TEXT NOT NULL CHECK (billing_cycle IN ('monthly', 'yearly')),
-    status TEXT NOT NULL CHECK (status IN ('active', 'past_due', 'canceled', 'trialing')),
-    current_period_start TIMESTAMPTZ NOT NULL,
-    current_period_end TIMESTAMPTZ NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+-- 23. PAYMENT IMMUTABILITY TRIGGER
+CREATE OR REPLACE FUNCTION public.trg_enforce_payment_immutability()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF OLD.payment_status = 'successful' THEN
+        IF TG_OP = 'DELETE' THEN
+            RAISE EXCEPTION 'Successful payments are immutable and cannot be deleted.';
+        END IF;
+        IF NEW.payment_status <> OLD.payment_status OR NEW.amount <> OLD.amount THEN
+            RAISE EXCEPTION 'Successful payments are immutable. Adjustments must be made via formal refund or rent adjustment entries.';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
 
--- INDEXES FOR OPTIMAL QUERY PERFORMANCE
-CREATE INDEX idx_pg_members_user_pg ON public.pg_members(user_id, pg_id);
-CREATE INDEX idx_rooms_pg_status ON public.rooms(pg_id, status);
-CREATE INDEX idx_beds_room_status ON public.beds(room_id, status);
-CREATE INDEX idx_beds_pg_status ON public.beds(pg_id, status);
-CREATE INDEX idx_tenants_pg_status ON public.tenants(pg_id, status);
-CREATE INDEX idx_tenants_phone ON public.tenants(phone);
-CREATE INDEX idx_rent_records_pg_month ON public.rent_records(pg_id, billing_month);
-CREATE INDEX idx_rent_records_tenant ON public.rent_records(tenant_id, status);
-CREATE INDEX idx_payments_pg_status ON public.payments(pg_id, payment_status);
-CREATE INDEX idx_payments_order ON public.payments(razorpay_order_id);
-CREATE INDEX idx_complaints_pg_status ON public.complaints(pg_id, status);
-CREATE INDEX idx_gate_logs_tenant_date ON public.gate_logs(tenant_id, logged_at);
-CREATE INDEX idx_whatsapp_status ON public.whatsapp_message_logs(delivery_status, retry_count);
-```
-
-### 4.2 Why Additional Tables Were Introduced
-1. `tenant_bed_assignments`: Critical for maintaining an unbroken historical audit trail. Tenants frequently switch rooms (e.g. 3-sharing to 2-sharing) or vacate. Binding the rent calculation directly to a bed assignment prevents data corruption when room rates change or beds get reassigned.
-2. `audit_logs`: Essential for legal compliance, tenant disputes, and tracking who collected cash payments or changed rent waivers.
-3. `pg_subscriptions`: Enables The Layout Office to monetize the software as a SaaS platform based on bed limits (e.g., up to 25 beds free/trial, 50 beds tier, unlimited enterprise).
-
----
-
-## 5. Authentication & Authorization Strategy
-
-### 5.1 Phone OTP Authentication (Supabase Auth)
-- Indian users overwhelmingly favor mobile numbers over emails. Authentication uses standard E.164 phone format (`+91XXXXXXXXXX`).
-- Supabase Auth supports Phone OTP natively (via providers such as Twilio, MSG91, or custom SMS webhooks).
-- Once OTP is verified, Supabase issues JWT session cookies managed securely by `@supabase/ssr`.
-
-### 5.2 Next.js Middleware Routing & Role Guards
-Routing uses dedicated route groups:
-- `/(auth)`: `/login`, `/verify-otp`, `/onboarding`
-- `/(dashboard)/owner/*`: Restricted to users with `role = 'owner'` in the active PG.
-- `/(dashboard)/warden/*`: Restricted to users with `role = 'warden'`.
-- `/(dashboard)/tenant/*`: Restricted to authenticated tenants.
-
-```typescript
-// Architectural Flow in middleware.ts
-1. Extract session cookie via createServerClient from @supabase/ssr.
-2. If no valid session -> Redirect to /login with redirect parameter.
-3. If path matches /(dashboard)/:
-   a. Retrieve user's active pg_id from a secure cookie (or default to first active PG).
-   b. Verify user's role in pg_members for that pg_id.
-   c. If attempting to access /owner but role is 'warden' or 'tenant' -> Redirect to unauthorized or role dashboard.
-   d. Inject x-pg-id and x-user-role into request headers for downstream server components.
+CREATE TRIGGER trg_payments_immutable
+BEFORE UPDATE OR DELETE ON public.payments
+FOR EACH ROW EXECUTE FUNCTION public.trg_enforce_payment_immutability();
 ```
 
 ---
 
-## 6. Payment Architecture (Razorpay Integration)
+## 5. Financial Ledger & Idempotent Payment Architecture
 
-### 6.1 Strict Server-Side Verification Pipeline
-No payment state transition ever trusts the frontend client. The complete lifecycle is shown below:
+### 5.1 The Double-Entry Allocation Flow
+The relationship between payments and rent records is strictly decoupled through `payment_allocations`:
+- One payment (e.g. ₹15,000) can allocate ₹10,000 to an overdue October bill and ₹5,000 as partial payment for November.
+- Multiple partial payments (e.g. ₹3,000 + ₹4,000) can allocate to a single ₹7,000 rent record.
 
-```
-[Tenant Mobile App]               [Next.js Server Action]              [Razorpay Gateway]
-        |                                    |                                  |
-        | 1. Click "Pay Rent (Rs 8,000)"     |                                  |
-        |----------------------------------->|                                  |
-        |                                    | 2. Create Order (order_xxx)      |
-        |                                    |--------------------------------->|
-        |                                    |<---------------------------------|
-        |                                    | 3. Save pending payment record   |
-        | 4. Return order_id & key_id        |    with idempotency key          |
-        |<-----------------------------------|                                  |
-        |                                                                       |
-        | 5. Launch Razorpay Checkout Modal (UPI / Cards / NetBanking)          |
-        |---------------------------------------------------------------------->|
-        |                                                                       |
-        | 6. User approves payment on UPI App (GPay/PhonePe)                    |
-        |                                                                       |
-        |                                    | 7. Webhook: payment.captured     |
-        |                                    |<---------------------------------|
-        |                                    | 8. Verify HMAC SHA256 Signature  |
-        |                                    | 9. Check if already processed    |
-        |                                    | 10. BEGIN TRANSACTION:           |
-        |                                    |     - Update payment: successful |
-        |                                    |     - Update rent_record balance |
-        |                                    |     - Generate PDF receipt       |
-        |                                    |     - Queue WhatsApp receipt msg |
-        |                                    |     COMMIT;                      |
-        |                                    | 11. Return HTTP 200 OK           |
-        |                                    |--------------------------------->|
-        |                                                                       |
-        | 12. Frontend redirects to /tenant/receipts/RCP-202611-0001           |
-        |<----------------------------------------------------------------------+
-```
+### 5.2 Server Action Transaction Caveat & Stored Procedure Execution
+In Next.js App Router, multiple asynchronous database queries executed inside a standard Server Action **do not run inside a single PostgreSQL transaction**. A failure midway leaves the database in a corrupted partial state.
 
-### 6.2 Partial Payments & Cash Payment Handling
-- **Partial Payments:** If rent is ₹9,000 and tenant pays ₹4,000, `rent_records.paid_amount` increments to ₹4,000, `balance_amount` adjusts to ₹5,000, and `status` transitions to `'partially_paid'`.
-- **Cash Payments:** The owner or authorized warden records cash received via a protected server action. A verified `payments` row is inserted (`payment_method = 'cash'`, `recorded_by_user_id = auth.uid()`), generating an official receipt number instantly.
+To guarantee ACID compliance, all financial mutations execute within a PostgreSQL Stored Procedure (`reconcile_razorpay_payment`):
 
-### 6.3 PDF Receipt Generation
-Receipts are generated server-side using `@react-pdf/renderer` or `pdf-lib`, featuring:
-- Official "The Layout Office" & PG branding.
-- Unique alphanumeric receipt number (`RCP-YYYYMM-XXXX`).
-- Tenant details, room & bed number.
-- Itemized breakdown (base rent, electricity, maintenance, adjustments).
-- Payment method & transaction timestamp.
-- Saved into the private Supabase Storage bucket `receipts` and delivered via signed URLs.
+```sql
+CREATE OR REPLACE FUNCTION public.reconcile_razorpay_payment(
+    p_event_id TEXT,
+    p_order_id TEXT,
+    p_payment_id TEXT,
+    p_signature TEXT,
+    p_amount NUMERIC(10, 2),
+    p_pg_id UUID,
+    p_tenant_id UUID,
+    p_rent_record_id UUID
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, auth, pg_temp
+AS $$
+DECLARE
+    v_payment_uuid UUID;
+    v_rent_balance NUMERIC(10, 2);
+    v_allocate_amt NUMERIC(10, 2);
+    v_receipt_no TEXT;
+BEGIN
+    -- 1. Idempotency Check on Webhook Event
+    IF EXISTS (SELECT 1 FROM public.webhook_events WHERE event_id = p_event_id AND processing_status = 'processed') THEN
+        RETURN TRUE; -- Already processed; return idempotent success
+    END IF;
 
----
+    -- 2. Prevent duplicate payment entry
+    IF EXISTS (SELECT 1 FROM public.payments WHERE razorpay_payment_id = p_payment_id) THEN
+        RETURN TRUE;
+    END IF;
 
-## 7. WhatsApp Automation Architecture
+    -- 3. Generate Receipt Number (Format: RCP-YYYYMM-XXXXX)
+    v_receipt_no := 'RCP-' || TO_CHAR(NOW(), 'YYYYMM') || '-' || UPPER(SUBSTRING(gen_random_uuid()::TEXT FROM 1 FOR 6));
 
-### 7.1 Architecture & Provider Strategy
-To avoid vendor lock-in and account approval delays, the messaging module uses an Abstract Provider Interface:
+    -- 4. Insert Payment Record
+    INSERT INTO public.payments (
+        pg_id, tenant_id, amount, payment_method, payment_status,
+        razorpay_order_id, razorpay_payment_id, razorpay_signature, receipt_number
+    ) VALUES (
+        p_pg_id, p_tenant_id, p_amount, 'razorpay_upi', 'successful',
+        p_order_id, p_payment_id, p_signature, v_receipt_no
+    ) RETURNING id INTO v_payment_uuid;
 
-```typescript
-// src/lib/whatsapp/types.ts
-export interface IWhatsAppService {
-  sendRentReminder(params: { phone: string; tenantName: string; amount: number; dueDate: string; paymentUrl: string }): Promise<WhatsAppResult>;
-  sendPaymentReceipt(params: { phone: string; tenantName: string; receiptNumber: string; amount: number; pdfUrl: string }): Promise<WhatsAppResult>;
-  sendGateClosingAlert(params: { phone: string; tenantName: string; closingTime: string }): Promise<WhatsAppResult>;
-  sendComplaintNotification(params: { phone: string; ticketId: string; category: string; description: string }): Promise<WhatsAppResult>;
-}
-```
+    -- 5. Lock and Retrieve Rent Record Balance
+    SELECT balance_amount INTO v_rent_balance
+    FROM public.rent_records
+    WHERE id = p_rent_record_id AND pg_id = p_pg_id
+    FOR UPDATE;
 
-Implementations:
-1. `MetaCloudApiProvider`: Direct Meta Graph API integration.
-2. `InteraktOrWatiProvider`: Plug-and-play BSP REST API.
-3. `MockDevWhatsAppProvider`: Logs payloads to console and writes to `whatsapp_message_logs` during local development without burning API credits.
+    IF v_rent_balance IS NULL THEN
+        RAISE EXCEPTION 'Target rent record does not exist or does not belong to PG.';
+    END IF;
 
-### 7.2 Scheduled Cron Triggers
-- **1st of Month at 09:00 AM IST:** Automated Rent Generation & 1st Reminder Broadcast via Vercel Cron or Supabase `pg_cron`.
-- **5th & 8th of Month:** Follow-up reminders for rent records where `status IN ('pending', 'partially_paid')`.
-- **Daily at 10:00 PM IST:** Gate Closing reminder broadcast to active tenants currently marked as "checked out" in `gate_logs`.
+    -- 6. Calculate Allocation
+    v_allocate_amt := LEAST(p_amount, v_rent_balance);
 
----
+    -- 7. Insert Payment Allocation
+    INSERT INTO public.payment_allocations (
+        pg_id, payment_id, rent_record_id, allocated_amount
+    ) VALUES (
+        p_pg_id, v_payment_uuid, p_rent_record_id, v_allocate_amt
+    );
 
-## 8. Mobile-First UI/UX & PWA Design System
+    -- 8. Update Rent Record Ledger
+    UPDATE public.rent_records
+    SET paid_amount = paid_amount + v_allocate_amt,
+        balance_amount = balance_amount - v_allocate_amt,
+        status = CASE 
+            WHEN (balance_amount - v_allocate_amt) <= 0 THEN 'paid'
+            ELSE 'partially_paid'
+        END,
+        updated_at = NOW()
+    WHERE id = p_rent_record_id;
 
-### 8.1 Visual & Ergonomic Foundations
-- **Target Audience:** Indian PG owners (often non-technical), wardens, and young college/working tenants.
-- **Form Factors:** Mobile-first layout (max-width `md` containers on mobile, responsive split views on desktop/tablets).
-- **Navigation:**
-  - Mobile: Native bottom navigation bar with 4 primary tabs + action sheet.
-  - Desktop: Collapsible sidebar navigation.
-- **Design Tokens:**
-  - Primary Brand: Professional Indigo & Slate (`#1E293B`, `#4F46E5`).
-  - Accent / Actions: Emerald Green for payments (`#059669`), Amber for pending/warnings (`#D97706`), Rose for overdue/complaints (`#E11D48`).
-  - Typography: Clean sans-serif (`Inter` or system-ui) optimized for high legibility on small screens.
-- **PWA Capabilities:**
-  - Manifest file with app icons, standalone display mode, theme colors.
-  - Service worker caching static assets, shell UI, and offline read access for emergency warden logs and tenant contact directories.
+    -- 9. Enqueue WhatsApp Receipt Notification Job
+    INSERT INTO public.notification_jobs (
+        pg_id, channel, recipient_phone, template_name,
+        template_variables, idempotency_key
+    ) VALUES (
+        p_pg_id, 'whatsapp', 
+        (SELECT phone FROM public.tenants WHERE id = p_tenant_id),
+        'payment_receipt_notification',
+        jsonb_build_object('receipt_number', v_receipt_no, 'amount', p_amount),
+        'payment_receipt_' || p_payment_id
+    );
 
----
+    -- 10. Mark Webhook as Processed
+    UPDATE public.webhook_events
+    SET processing_status = 'processed', processed_at = NOW()
+    WHERE event_id = p_event_id;
 
-## 9. Proposed Project Folder Structure
-
-```
-D:\TECH\PG MANAGEMENT\
-├── .agents/                               # Existing AI agent skills
-├── .github/
-│   └── workflows/
-│       └── ci.yml                         # Lint, type-check, test
-├── public/
-│   ├── icons/                             # PWA icon set (192x192, 512x512)
-│   ├── manifest.json                      # PWA web app manifest
-│   ├── favicon.ico
-│   └── sw.js                              # PWA service worker
-├── src/
-│   ├── app/
-│   │   ├── (auth)/                        # Authentication Route Group
-│   │   │   ├── login/page.tsx
-│   │   │   ├── verify-otp/page.tsx
-│   │   │   └── onboarding/page.tsx
-│   │   ├── (dashboard)/                   # Protected Dashboard Route Group
-│   │   │   ├── layout.tsx                 # Role-aware navigation & PG context provider
-│   │   │   ├── owner/                     # Owner Experience
-│   │   │   │   ├── page.tsx               # Analytics & Executive Overview
-│   │   │   │   ├── pgs/page.tsx           # Multi-PG Switcher & Property Config
-│   │   │   │   ├── rooms/page.tsx         # Room & Bed Visual Matrix
-│   │   │   │   ├── tenants/page.tsx       # Tenant Directory & Onboarding
-│   │   │   │   ├── rent/page.tsx          # Monthly Rent Collections & Cash Entry
-│   │   │   │   ├── expenses/page.tsx      # Expense Tracker & Petty Cash
-│   │   │   │   ├── complaints/page.tsx    # Complaint SLA Tracker
-│   │   │   │   ├── gate-logs/page.tsx     # Gate Register Overview
-│   │   │   │   ├── mess/page.tsx          # Weekly Menu Editor
-│   │   │   │   └── reports/page.tsx       # Financial & Occupancy Export
-│   │   │   ├── warden/                    # Warden Experience
-│   │   │   │   ├── page.tsx               # Warden Daily Operations Summary
-│   │   │   │   ├── beds/page.tsx          # Quick Vacancy Check & Room Status
-│   │   │   │   ├── gate-entry/page.tsx    # Fast QR/Manual Check-in & Check-out
-│   │   │   │   └── complaints/page.tsx    # Ticket Resolution & Photo Upload
-│   │   │   └── tenant/                    # Tenant Experience
-│   │   │       ├── page.tsx               # Rent Due Card & Quick Actions
-│   │   │       ├── pay/page.tsx           # Razorpay Payment Screen
-│   │   │       ├── receipts/page.tsx      # PDF Receipts Vault
-│   │   │       ├── complaints/page.tsx    # Raise Maintenance Ticket
-│   │   │       ├── gate-pass/page.tsx     # Late Entry / Night Out Request
-│   │   │       └── mess/page.tsx          # Today's Meal Schedule
-│   │   ├── api/
-│   │   │   ├── webhooks/
-│   │   │   │   ├── razorpay/route.ts      # Razorpay payment.captured webhook
-│   │   │   │   └── whatsapp/route.ts      # Inbound WhatsApp message/status webhook
-│   │   │   ├── cron/
-│   │   │   │   ├── rent-generation/route.ts # 1st of month auto rent billing
-│   │   │   │   ├── rent-reminders/route.ts  # Overdue notifications
-│   │   │   │   └── gate-reminder/route.ts   # 10 PM gate alert
-│   │   │   └── receipts/[paymentId]/route.ts# Dynamic PDF receipt download
-│   │   ├── layout.tsx                     # Root Layout
-│   │   ├── page.tsx                       # Public Landing Page / Marketing
-│   │   └── globals.css                    # Tailwind CSS definitions
-│   ├── components/
-│   │   ├── ui/                            # Atomic UI: Button, Input, Modal, Badge, Card, Drawer
-│   │   ├── shared/                        # TopBar, BottomNav, Sidebar, FileUpload, StatusBadge
-│   │   ├── owner/                         # BedMatrixGrid, FinancialCharts, TenantForm
-│   │   ├── warden/                        # GateScanner, QuickCheckoutList
-│   │   └── tenant/                        # RentPayCard, ComplaintTimeline, MessTodayCard
-│   ├── lib/
-│   │   ├── supabase/
-│   │   │   ├── client.ts                  # Client-side Supabase Browser Client
-│   │   │   ├── server.ts                  # Server-side Supabase SSR Client
-│   │   │   ├── middleware.ts              # Session & cookie validation
-│   │   │   └── admin.ts                   # Service-role admin client (restricted)
-│   │   ├── razorpay/
-│   │   │   ├── client.ts                  # Razorpay SDK instance
-│   │   │   └── verify.ts                  # Webhook signature validation
-│   │   ├── whatsapp/
-│   │   │   ├── client.ts                  # Provider router
-│   │   │   ├── meta-provider.ts           # Meta Cloud API
-│   │   │   ├── mock-provider.ts           # Local development logger
-│   │   │   └── templates.ts               # Approved template configurations
-│   │   ├── pdf/
-│   │   │   └── receipt-document.tsx       # PDF receipt React component
-│   │   ├── validations/                   # Zod validation schemas for all mutations
-│   │   └── utils/
-│   ├── types/
-│   │   ├── database.types.ts              # Generated Supabase TypeScript types
-│   │   └── index.ts                       # Shared application domain models
-│   └── middleware.ts                      # Edge auth & role-based routing
-├── supabase/
-│   ├── config.toml
-│   ├── migrations/
-│   │   ├── 20261120000000_core_schema.sql # Complete DDL
-│   │   └── 20261120000001_rls_security.sql# Security Definer functions & RLS
-│   └── seed.sql                           # Clean development seed data
-├── PROJECT_PLAN.md                        # This document
-├── package.json
-├── tsconfig.json
-├── tailwind.config.ts
-└── next.config.ts
+    RETURN TRUE;
+END;
+$$;
 ```
 
 ---
 
-## 10. Environment Variables Checklist
+## 6. Flexible Rent Generation & Billing Model
 
-### 10.1 Public Client-Side (`.env.local`)
-```env
-# Supabase Public Configuration
-NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
-NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJhbGciOi...
+### 6.1 Mid-Month Stays & Proration Logic
+Instead of a rigid `UNIQUE(tenant_id, billing_month)` constraint, billing is anchored to assignment intervals: `UNIQUE (assignment_id, period_start, period_end)`.
 
-# Application Branding & URLs
-NEXT_PUBLIC_APP_URL=http://localhost:3000
-NEXT_PUBLIC_APP_NAME="PG Manager"
-NEXT_PUBLIC_BRAND_NAME="The Layout Office"
+#### Proration Formula
+For a tenant joining or vacating mid-month:
+$$\text{Days in Month} = \text{DATE\_PART}('days', \text{DATE\_TRUNC}('month', \text{Period}) + \text{INTERVAL} '1 month - 1 day')$$
+$$\text{Days Occupied} = (\text{period\_end} - \text{period\_start} + 1)$$
+$$\text{Prorated Rent} = \text{ROUND}\left(\frac{\text{Agreed Monthly Rent}}{\text{Days in Month}} \times \text{Days Occupied}, 2\right)$$
 
-# Razorpay Client-Side Key ID
-NEXT_PUBLIC_RAZORPAY_KEY_ID=rzp_test_...
+### 6.2 Idempotent Monthly Rent Generation
+Scheduled to execute on the 1st of each month via Supabase `pg_cron` or Vercel Cron. The algorithm verifies whether an interval record already exists for each active assignment before inserting, ensuring that running the cron job twice never duplicates bills.
+
+---
+
+## 7. Tenant & Warden Authentication & Account-Linking
+
+### 7.1 The Account Hijacking Risk (And Its Resolution)
+If a user could create an account with a phone number and immediately claim any pre-existing tenant record with that phone, an attacker could claim someone else's tenancy if phone verification was loose or mismatched.
+
+### 7.2 Secure Verification Pipeline
+```
+[Owner Portal]
+  | 1. Owner registers tenant (Name, Phone, Bed Assignment)
+  | 2. DB creates 'tenants' row (user_id IS NULL)
+  | 3. DB creates 'tenant_invitations' (unique cryptographic token, 7-day expiry)
+  | 4. WhatsApp/SMS sends invitation link: https://app.thelayoutoffice.com/join?token=XYZ
+  v
+[Tenant Mobile Browser]
+  | 5. Tenant opens link -> enters phone number
+  | 6. Supabase Phone Auth sends OTP (E.164 +91...)
+  | 7. Tenant submits OTP -> Supabase issues verified auth.users session
+  | 8. Client calls RPC: public.link_tenant_profile_on_login(token)
+  v
+[PostgreSQL Database (SECURITY DEFINER)]
+  | 9. RPC checks:
+  |    - Is auth.uid() valid?
+  |    - Does auth.users.phone MATCH tenant_invitations.phone?
+  |    - Is token valid and unexpired?
+  | 10. Links: tenants.user_id = auth.uid()
+  | 11. Inserts pg_members: (pg_id, auth.uid(), role='tenant', status='active')
+  | 12. Updates tenant_invitations status to 'accepted'
+  | 13. Returns active pg_id and redirects to /tenant dashboard
 ```
 
-### 10.2 Secret Server-Side (`.env.local` / Vercel Secrets)
-```env
-# Supabase Admin Access (Never expose to browser)
-SUPABASE_SERVICE_ROLE_KEY=eyJhbGciOi...
+### 7.3 Vacating & Historical Data Retention
+When a tenant vacates:
+- `tenants.status` transitions to `'vacated'`.
+- `tenant_bed_assignments.is_active` is set to `FALSE`.
+- `pg_members.status` transitions to `'inactive'`.
+- **Retention:** All historical `rent_records`, `payments`, `receipts`, and `gate_logs` are preserved indefinitely.
+- **RLS Access Post-Vacating:** The vacated tenant retains read-only access to download past receipts and review their stay history, but cannot raise complaints or register gate passes.
 
-# Razorpay Server Secrets
-RAZORPAY_KEY_SECRET=your_razorpay_secret
-RAZORPAY_WEBHOOK_SECRET=your_webhook_signing_secret
+---
 
-# WhatsApp Provider Configuration
-WHATSAPP_PROVIDER=mock # Options: 'mock' | 'meta' | 'wati' | 'interakt'
-WHATSAPP_API_TOKEN=your_meta_system_user_token
-WHATSAPP_PHONE_NUMBER_ID=your_whatsapp_phone_number_id
-WHATSAPP_BUSINESS_ACCOUNT_ID=your_waba_id
-WHATSAPP_WEBHOOK_VERIFY_TOKEN=custom_random_token_for_verification
+## 8. Data Privacy & Statutory Compliance (India DPDP Act 2023)
 
-# Cron Job Authorization
-CRON_SECRET=your_random_32_character_cron_secret
+### 8.1 Data Minimization
+- **No Full Aadhaar Collection:** Full 12-digit Aadhaar storage requires UIDAI license compliance and dedicated Aadhaar Data Vaults. PG Manager explicitly prohibits storing full Aadhaar numbers or unmasked Aadhaar documents.
+- **Alternative KYC:** Allows College ID, Corporate Employment ID, Driver's License, Voter ID, or **Masked Aadhaar (Last 4 Digits Only)**.
+- **Private Storage Buckets:** All identity documents and complaint photos reside in **strictly private** Supabase Storage buckets (`tenant-kyc-docs` and `complaint-attachments`).
+- **Short-Lived Signed URLs:** The application never exposes public document URLs. Pre-signed download URLs with a 15-minute expiration are generated server-side after verifying that the caller is an authorized owner, warden, or the owning tenant.
+
+### 8.2 Tax & Receipt Transparency
+- Removed misleading blanket claims of "GST-compliant receipts".
+- Receipts are labeled **"Rent Receipt"** for residential accommodation.
+- If an owner provides a valid GSTIN in `pgs.gstin`, receipts include the GSTIN and SAC code (9963 / 9972). If not, standard non-tax receipts are generated, fully compliant for tenant HRA (House Rent Allowance) tax exemptions without fraudulent tax representations.
+
+---
+
+## 9. Reliable WhatsApp Queue & Notification Architecture
+
+### 9.1 Reliable Queue Pattern (`notification_jobs`)
+All outgoing notifications are written to the `notification_jobs` table before delivery:
+- Status lifecycle: `queued` $\rightarrow$ `processing` $\rightarrow$ `sent` $\rightarrow$ `delivered` (or `failed` $\rightarrow$ exponential retry $\rightarrow$ `dead_letter`).
+- **Idempotency Keys:** Every job requires a unique key (e.g. `rent_reminder_{pg_id}_{tenant_id}_{billing_month}`). Duplicate attempts to insert the same key are rejected by PostgreSQL.
+- **Rate Limiting:** Workers process batches with respect to Meta WhatsApp Cloud API tier limits (80 messages/second for Tier 1).
+- **Tenant Opt-Out:** Respects `tenants.whatsapp_opt_out`. If `TRUE`, non-critical marketing or general broadcast messages are skipped.
+
+---
+
+## 10. Finite-State Gate Management System
+
+### 10.1 State Machine
+```
+[CHECKED_IN] (Inside premises)
+     |
+     +---> [CHECKED_OUT] (Office/College during day)
+     |          |
+     |          +---> Returns before gate closing ---> [CHECKED_IN]
+     |          |
+     |          +---> Returns AFTER gate closing ---> [LATE_ENTRY] (Warden Verified)
+     |
+     +---> [NIGHT_OUT_REQUESTED] (Overnight leave)
+                |
+                +---> Warden Approved ---> [NIGHT_OUT_APPROVED]
+                |
+                +---> Returns next day ---> [CHECKED_IN]
+```
+
+### 10.2 Targeted 10 PM Gate Closing Reminder
+The scheduled 10 PM alert does not blast all tenants. It executes a targeted query:
+```sql
+SELECT t.phone, t.full_name, p.gate_closing_time
+FROM public.tenants t
+JOIN public.pgs p ON p.id = t.pg_id
+WHERE t.status = 'active'
+  AND t.whatsapp_opt_out = FALSE
+  -- Filter to tenants whose latest gate entry is a check_out or night_out without subsequent check_in
+  AND (
+      SELECT gl.entry_type 
+      FROM public.gate_logs gl 
+      WHERE gl.tenant_id = t.id 
+      ORDER BY gl.logged_at DESC 
+      LIMIT 1
+  ) IN ('check_out', 'night_out_request');
 ```
 
 ---
 
-## 11. Technical Risks, Gaps & Architectural Mitigations
+## 11. Technical Compatibility & Modern Standards
 
-| # | Identified Risk / Challenge | Potential Impact | Architectural Mitigation Strategy |
-|---|---|---|---|
-| 1 | **WhatsApp Template Approval Delays** | Notifications blocked in production if Meta rejects custom text templates. | Use pre-approved transactional utility templates (payment receipts, account updates) rather than promotional marketing templates. Provide fallback SMS via MSG91/Twilio if WhatsApp delivery fails. Implement `MockDevWhatsAppProvider` so development and testing proceed unimpeded. |
-| 2 | **Indian SMS / DLT Regulations** | Indian telecom mandates DLT registration for transactional SMS. Sending OTPs without DLT registration leads to message rejection by carriers. | Supabase Phone Auth integrates directly with Twilio or MSG91. During development and staging, use Supabase's Test Phone Numbers with fixed OTPs to avoid telecom carrier dependencies. Complete DLT registration early in Phase 0. |
-| 3 | **Payment Webhook Race Conditions** | Razorpay webhooks and tenant client redirects may arrive simultaneously, causing duplicate payment entries. | Enforce database UNIQUE constraint on `razorpay_payment_id`. Use a PostgreSQL atomic transaction (`SERIALIZABLE` or `FOR UPDATE` lock) inside an RPC or Server Action to ensure idempotent ledger updates. |
-| 4 | **Gate Operation in Low-Connectivity Basements** | Wardens unable to submit gate entry logs due to poor cellular reception in entryways/basements. | PWA Service Worker caches the gate log UI. Offline entries are temporarily stored in browser IndexedDB and automatically synchronized as soon as connectivity resumes. |
-| 5 | **Split Multi-Tenant Razorpay Payouts** | When multiple PG owners use the platform, funds collected via Razorpay must either be routed to the platform account and paid out, or sent directly to each PG owner's Razorpay account. | Architecture supports two models: **Model A (Direct Merchant Credential):** Each PG owner enters their own Razorpay Key & Secret in settings. **Model B (Platform Route):** The Layout Office collects payments and uses Razorpay Route / Linked Accounts for automated split settlements. We recommend Model A for initial launch to eliminate platform liability, transitioning to Model B for SaaS subscription tiers. |
-| 6 | **Concurrent Bed Allocation Race Conditions** | Two wardens/owners allocating the same vacant bed to two different tenants at the same minute. | Database exclusion constraint or a conditional transactional update: `UPDATE beds SET status = 'occupied' WHERE id = target_id AND status = 'vacant' RETURNING id;`. If 0 rows return, raise an error immediately. |
+- **Next.js 15+ App Router:** Fully aligns with Server Components and Server Actions. Employs `@supabase/ssr` with standard cookie adapter patterns.
+- **Database Migrations:** Supabase CLI migrations located in `supabase/migrations/` using timestamped SQL files. No external ORMs (Prisma/Drizzle) that introduce abstraction overhead or conflict with advanced PostgreSQL RLS features.
+- **PWA Implementation:** Configured via `@serwist/next` (the modern successor to `next-pwa`, compatible with Turbopack and Webpack), including offline caching of shell UI and local cache for warden gate logging.
+- **Cron Jobs:** Dual-engine architecture:
+  - Supabase `pg_cron`: Internal high-frequency maintenance (rent billing, queue retries, ledger checks).
+  - Vercel Cron: External orchestrator calling `/api/cron/*` endpoints protected with `Bearer ${CRON_SECRET}`.
 
 ---
 
 ## 12. Phased Development Roadmap
 
 ```
-+----------------------------------------------------------------------------------------------------------+
-| PHASE 0: External Accounts & Prerequisite Setup (Parallel Track)                                         |
-| - Supabase Project creation & storage bucket setup                                                       |
-| - Razorpay Merchant Account & Test API Key generation                                                    |
-| - Meta WhatsApp Business Account / BSP registration & template drafts                                    |
-+----------------------------------------------------------------------------------------------------------+
-                                                    |
-                                                    v
-+----------------------------------------------------------------------------------------------------------+
-| PHASE 1: Project Foundation & Database Architecture                                                      |
-| - Initialize Next.js 15+ App Router, TypeScript (Strict Mode), Tailwind CSS, PWA Shell                   |
-| - Execute Supabase Migrations: 16 core tables, check constraints, foreign keys, and indexes              |
-| - Apply PostgreSQL RLS security definer policies & verify multi-tenant isolation tests                   |
-+----------------------------------------------------------------------------------------------------------+
-                                                    |
-                                                    v
-+----------------------------------------------------------------------------------------------------------+
-| PHASE 2: Authentication, Onboarding & Role-Based Permissions                                            |
-| - Supabase Phone OTP auth integration with Indian phone format validation                                |
-| - User profile setup & PG property creation wizard (Owner Onboarding)                                    |
-| - Warden & Tenant invitation flows via secure link/code                                                  |
-| - Next.js Middleware route guards for /owner, /warden, and /tenant                                       |
-+----------------------------------------------------------------------------------------------------------+
-                                                    |
-                                                    v
-+----------------------------------------------------------------------------------------------------------+
-| PHASE 3: Core PG Management Modules                                                                      |
-| - Rooms & Beds management matrix (visual grid of occupancy)                                              |
-| - Tenant KYC onboarding (document upload to private storage, emergency contacts, bed assignment)         |
-| - Gate entry/exit digital register with late-entry tagging                                               |
-| - Maintenance complaints ticketing system with photo attachments and status workflow                    |
-| - Weekly Mess Menu scheduling & daily view                                                               |
-| - Operational expense tracker with receipt uploads and category breakdown                                |
-+----------------------------------------------------------------------------------------------------------+
-                                                    |
-                                                    v
-+----------------------------------------------------------------------------------------------------------+
-| PHASE 4: Razorpay Payments & Dynamic PDF Receipts                                                        |
-| - Server-side Razorpay Order creation API                                                                |
-| - Mobile-first Razorpay Checkout modal (UPI QR, GPay, PhonePe, Cards)                                    |
-| - Verified Webhook receiver (`/api/webhooks/razorpay`) with HMAC signature checking & idempotency        |
-| - Manual cash payment recording & reconciliation by Owner/Warden                                         |
-| - Automatic GST-compliant PDF receipt generation and storage                                             |
-+----------------------------------------------------------------------------------------------------------+
-                                                    |
-                                                    v
-+----------------------------------------------------------------------------------------------------------+
-| PHASE 5: WhatsApp Automation & Scheduled Background Jobs                                                 |
-| - WhatsApp Provider adapter (Meta Cloud API / WATI / Local Mock logger)                                  |
-| - 1st of month rent bill generation & reminder trigger                                                   |
-| - Instant payment receipt WhatsApp notification                                                          |
-| - Warden complaint alerts & tenant resolution notifications                                              |
-| - Daily 10 PM gate-closing broadcast to checked-out tenants                                              |
-+----------------------------------------------------------------------------------------------------------+
-                                                    |
-                                                    v
-+----------------------------------------------------------------------------------------------------------+
-| PHASE 6: Testing, Security Audits & Pilot Run                                                            |
-| - RLS penetration testing: verify cross-tenant data leakage is mathematically impossible                 |
-| - Webhook replay attack tests and network drop simulations                                               |
-| - Real-device mobile PWA testing across Android & iOS browsers                                           |
-| - Pilot deployment with 1-2 actual PG properties for real-world feedback                                 |
-+----------------------------------------------------------------------------------------------------------+
-                                                    |
-                                                    v
-+----------------------------------------------------------------------------------------------------------+
-| PHASE 7: Production Launch & SaaS Subscription Billing                                                   |
-| - Production domain & Vercel edge deployment                                                             |
-| - The Layout Office SaaS subscription billing (bed-tier limits)                                          |
-| - Comprehensive monitoring (Sentry error tracking, Supabase database metrics)                            |
-+----------------------------------------------------------------------------------------------------------+
+Phase 0: External Accounts & Prerequisite Setup (Parallel Track)
+  - Supabase project setup, custom SMS/OTP configuration
+  - Razorpay Merchant Account & webhook test secret generation
+  - Meta WhatsApp Business Account & template drafting
+
+Phase 1: Project Foundation & Database Architecture (NEXT STEP)
+  - Next.js 15+ App Router scaffolding with TypeScript (strict mode) and Tailwind CSS
+  - Supabase DDL migration execution (22 tables with composite foreign keys)
+  - Security Definer helper functions & RLS policy enforcement
+  - PWA shell configuration with @serwist/next
+
+Phase 2: Authentication, Onboarding & Role-Based Permissions
+  - Phone OTP authentication with E.164 +91 validation
+  - create_new_pg_business RPC integration for secure owner onboarding
+  - Tenant and staff invitation token generation and linking RPCs
+  - Role-guarded dashboard layouts (/owner, /warden, /tenant)
+
+Phase 3: Core Operations Modules
+  - Rooms & Beds visual occupancy matrix
+  - Tenant KYC directory with masked ID storage
+  - Digital gate register with check-in/out and night-out workflow
+  - Maintenance complaint ticketing with status history & photo uploads
+  - Weekly mess menu editor & today's meal card
+  - Operational expense logging with petty cash tracking
+
+Phase 4: Razorpay Payments & Ledgers
+  - Server-side Razorpay order creation
+  - Mobile-first Razorpay Checkout modal
+  - reconcile_razorpay_payment stored procedure & webhook event deduplication
+  - Double-entry payment allocations to rent records
+  - Manual cash payment recording by owner/warden
+  - Server-generated PDF rent receipts with signed storage links
+
+Phase 5: WhatsApp Queue & Automations
+  - Notification queue worker with exponential retry backoff
+  - 1st of month automated rent billing & notification job
+  - Instant payment receipt dispatch
+  - Targeted 10 PM gate-closing notification to checked-out tenants
+
+Phase 6: Verification, Security Audits & Pilot
+  - RLS penetration testing across tenant boundaries
+  - Webhook replay attack tests and network drop simulations
+  - Real-device mobile testing across Android and iOS
+  - Live pilot with 1-2 actual PG properties
+
+Phase 7: Production Launch & SaaS Monetization
+  - Production domain deployment on Vercel Edge
+  - The Layout Office SaaS subscription billing (bed-tier limits)
+  - Sentry error monitoring and performance telemetry
 ```
 
 ---
 
-## 13. Summary & Recommended Next Steps
+## 13. Architectural Decisions: Mandatory vs. Optional & Approvals
 
-### Architect's Assessment
-The workspace is currently in an optimal, clean state ready for scaffolding. The technical stack (Next.js App Router, TypeScript, Tailwind CSS, Supabase PostgreSQL with RLS, Razorpay, WhatsApp API) perfectly matches the requirements for a high-performance, mobile-first Indian PG platform.
+### 13.1 Mandatory Security Requirements (Non-Negotiable)
+1. **Composite Foreign Keys:** All child tables must include `(pg_id, id)` constraints.
+2. **Database-Level RLS:** 100% of tables must have RLS enabled with `SECURITY DEFINER` role lookup helpers.
+3. **Payment Immutability:** Successful payments must never be deleted or updated in place.
+4. **Idempotent Webhook Processing:** Webhook events must be deduplicated via `webhook_events`.
+5. **Masked ID Storage:** No full 12-digit Aadhaar numbers stored in the database.
 
-By completing this comprehensive architectural specification and recording it in `PROJECT_PLAN.md`, we have established:
-1. Strict tenant isolation through database-level Row Level Security (RLS).
-2. Resilient, tamper-proof payment processing that relies solely on verified server-side webhooks.
-3. Decoupled third-party services so development is never stalled by external WhatsApp or SMS approval processes.
-4. Clean separation of concerns between Owner, Warden, and Tenant personas.
+### 13.2 Decisions Requiring Owner Approval Prior to Phase 1 Scaffolding
 
-### Immediate Action Required
-Please review this architectural proposal and confirm your approval. Upon receiving your confirmation, we will proceed directly to **Phase 1: Project Foundation & Database Architecture**.
+1. **Razorpay Payment Payout Model:**
+   - **Option A (Recommended for Initial Launch):** Each PG owner configures their own Razorpay Key ID and Secret in their PG Settings. Rent flows directly into the owner's bank account. The Layout Office has zero payout liability or NBFC/escrow compliance burdens.
+   - **Option B (Platform Route):** The Layout Office collects all rent payments into a master Razorpay account and splits payouts to PG owners via Razorpay Route, deducting a platform SaaS fee. Requires extensive RBI payment aggregator compliance and merchant agreements.
+   - *Recommendation:* Approve Option A for Launch; introduce Option B in Phase 7.
+
+2. **WhatsApp Provider Strategy for Launch:**
+   - **Option A (Meta Cloud API Direct):** Lower message costs (~₹0.40 - ₹0.80 per conversation), but requires Meta Business Verification, Facebook Developer App setup, and business credit card.
+   - **Option B (BSP Partner - WATI / Interakt / AiSensy):** Higher message costs (~₹0.90 - ₹1.20), but turnkey onboarding, simpler UI, and managed template approvals.
+   - *Recommendation:* Support both via our abstract `IWhatsAppService` adapter, defaulting to a local mock provider during Phase 1-3 development.
+
+3. **SMS OTP Provider for Supabase Auth:**
+   - In India, commercial transactional SMS requires DLT (Distributed Ledger Technology) registration.
+   - *Recommendation:* During development and initial staging, use Supabase's pre-configured Test Phone Numbers with fixed OTPs. For production, connect Twilio or MSG91 with DLT-registered templates.
