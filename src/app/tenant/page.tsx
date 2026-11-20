@@ -1,14 +1,10 @@
 import { createClient } from "@/lib/supabase/server";
 import { getAuthContext } from "@/lib/auth/roles";
 import { redirect } from "next/navigation";
-import { 
-  BedDouble, 
-  CreditCard, 
-  DoorOpen, 
-  UtensilsCrossed, 
-  AlertCircle, 
-  Sparkles 
-} from "lucide-react";
+import { TenantDashboardClient, type TenantInfo } from "./TenantDashboardClient";
+import type { ComplaintItem } from "@/components/dashboard/ComplaintsBoard";
+import type { MessMenuItem } from "@/components/dashboard/MessMenuPlanner";
+import type { GateState } from "@/types/database.types";
 
 export default async function TenantPage() {
   const context = await getAuthContext();
@@ -17,108 +13,141 @@ export default async function TenantPage() {
     redirect("/onboarding");
   }
 
+  const pgId = context.primaryMembership.pg_id;
   const supabase = await createClient();
 
-  // Fetch tenant record for this user in this PG
-  const { data: tenant } = await supabase
-    .from("tenants")
-    .select("*")
-    .eq("pg_id", context.primaryMembership.pg_id)
-    .eq("user_id", context.userId)
-    .single();
+  // Parallel fetch
+  const [
+    { data: pg },
+    { data: rawTenant },
+    { data: rawAssignments },
+    { data: rawRooms },
+    { data: rawBeds },
+    { data: rawComplaints },
+    { data: rawMenu },
+  ] = await Promise.all([
+    supabase.from("pgs").select("id, name, city, gate_closing_time").eq("id", pgId).single(),
+    supabase.from("tenants").select("*").eq("pg_id", pgId).eq("user_id", context.userId).maybeSingle(),
+    supabase.from("tenant_bed_assignments").select("*").eq("pg_id", pgId).eq("is_active", true),
+    supabase.from("rooms").select("*").eq("pg_id", pgId),
+    supabase.from("beds").select("*").eq("pg_id", pgId),
+    supabase.from("complaints").select("*").eq("pg_id", pgId).order("created_at", { ascending: false }),
+    supabase.from("mess_menu").select("*").eq("pg_id", pgId).eq("is_active", true),
+  ]);
 
-  const { data: pg } = await supabase
-    .from("pgs")
-    .select("*")
-    .eq("id", context.primaryMembership.pg_id)
-    .single();
+  if (!pg) {
+    redirect("/onboarding");
+  }
+
+  // Lookup maps
+  const roomMap = new Map((rawRooms || []).map((r) => [r.id, r]));
+  const bedMap = new Map((rawBeds || []).map((b) => [b.id, b]));
+
+  // Find tenant assignment
+  const activeAssignment = rawTenant
+    ? (rawAssignments || []).find((a) => a.tenant_id === rawTenant.id)
+    : null;
+  const currentBed = activeAssignment ? bedMap.get(activeAssignment.bed_id) : null;
+  const currentRoom = currentBed ? roomMap.get(currentBed.room_id) : null;
+
+  // Gate state
+  let gateState: GateState = "inside";
+  if (rawTenant) {
+    const { data: stateRec } = await supabase
+      .from("tenant_gate_states")
+      .select("current_state")
+      .eq("pg_id", pgId)
+      .eq("tenant_id", rawTenant.id)
+      .maybeSingle();
+
+    if (stateRec?.current_state) {
+      gateState = stateRec.current_state;
+    }
+  }
+
+  // Find roommates sharing the same room
+  let roommates: { full_name: string; bed_label: string }[] = [];
+  if (currentRoom && rawTenant) {
+    const bedsInRoom = (rawBeds || []).filter((b) => b.room_id === currentRoom.id);
+    const bedIdsInRoom = new Set(bedsInRoom.map((b) => b.id));
+    const otherAssignments = (rawAssignments || []).filter(
+      (a) => bedIdsInRoom.has(a.bed_id) && a.tenant_id !== rawTenant.id
+    );
+
+    if (otherAssignments.length > 0) {
+      const otherTenantIds = otherAssignments.map((a) => a.tenant_id);
+      const { data: otherTenants } = await supabase
+        .from("tenants")
+        .select("id, full_name")
+        .in("id", otherTenantIds);
+
+      const otherMap = new Map((otherTenants || []).map((t) => [t.id, t.full_name]));
+      roommates = otherAssignments.map((a) => {
+        const bed = bedMap.get(a.bed_id);
+        return {
+          full_name: otherMap.get(a.tenant_id) || "Roommate",
+          bed_label: bed?.bed_label || "Bed",
+        };
+      });
+    }
+  }
+
+  const tenantInfo: TenantInfo = {
+    id: rawTenant?.id || "",
+    pg_id: pgId,
+    full_name: rawTenant?.full_name || context.fullName || "Resident",
+    phone: rawTenant?.phone || "",
+    joining_date: activeAssignment?.assigned_from || rawTenant?.created_at?.split("T")[0] || new Date().toISOString().split("T")[0],
+    current_gate_state: gateState,
+    current_bed: activeAssignment && currentBed && currentRoom ? {
+      bed_label: currentBed.bed_label,
+      room_id: currentRoom.id,
+      room_number: currentRoom.room_number,
+      monthly_rent: activeAssignment.agreed_monthly_rent,
+      room_type: currentRoom.room_type,
+      has_ac: currentRoom.has_ac,
+      has_attached_bathroom: currentRoom.has_attached_bathroom,
+    } : null,
+    roommates,
+  };
+
+  const tenantComplaints: ComplaintItem[] = (rawComplaints || [])
+    .filter((c) => rawTenant && c.tenant_id === rawTenant.id)
+    .map((c) => {
+      const r = c.room_id ? roomMap.get(c.room_id) : null;
+      return {
+        id: c.id,
+        pg_id: c.pg_id,
+        tenant_id: c.tenant_id,
+        tenant_name: tenantInfo.full_name,
+        room_number: r?.room_number || null,
+        category: c.category,
+        priority: c.priority,
+        title: c.title,
+        description: c.description,
+        photo_storage_paths: c.photo_storage_paths,
+        status: c.status,
+        created_at: c.created_at,
+      };
+    });
+
+  const menuItems: MessMenuItem[] = (rawMenu || []).map((m) => ({
+    id: m.id,
+    pg_id: m.pg_id,
+    day_of_week: m.day_of_week,
+    meal_type: m.meal_type,
+    menu_items: m.menu_items,
+    start_time: m.start_time,
+    end_time: m.end_time,
+    special_notes: m.special_notes,
+  }));
 
   return (
-    <div className="space-y-6">
-      {/* Resident Identity Card */}
-      <div className="bg-gradient-to-r from-purple-900 to-slate-900 rounded-3xl p-6 text-white shadow-xl shadow-purple-900/10">
-        <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-purple-500/20 text-purple-300 text-xs font-semibold uppercase tracking-wider mb-2">
-          <Sparkles className="w-3.5 h-3.5" /> Resident Portal
-        </div>
-        <h1 className="text-2xl font-black tracking-tight">
-          Hello, {tenant?.full_name || context.fullName || "Resident"}
-        </h1>
-        <p className="text-xs text-purple-200 mt-1">
-          {pg?.name} • {pg?.city}
-        </p>
-      </div>
-
-      {/* Quick Gate & Stay Status */}
-      <div className="grid grid-cols-2 gap-4">
-        <div className="bg-white rounded-2xl border border-slate-200/80 p-5 shadow-sm">
-          <div className="w-9 h-9 rounded-xl bg-emerald-100 text-emerald-700 flex items-center justify-center mb-2">
-            <DoorOpen className="w-5 h-5" />
-          </div>
-          <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">
-            Presence Status
-          </span>
-          <span className="text-base font-bold text-emerald-600 block mt-0.5">
-            Inside Campus
-          </span>
-          <span className="text-[11px] text-slate-400 block mt-0.5">
-            Gate Closes {pg?.gate_closing_time || "22:00:00"}
-          </span>
-        </div>
-
-        <div className="bg-white rounded-2xl border border-slate-200/80 p-5 shadow-sm">
-          <div className="w-9 h-9 rounded-xl bg-purple-100 text-purple-700 flex items-center justify-center mb-2">
-            <BedDouble className="w-5 h-5" />
-          </div>
-          <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">
-            Assigned Bed
-          </span>
-          <span className="text-base font-bold text-slate-800 block mt-0.5">
-            {tenant ? "Room Active" : "Pending Alloc"}
-          </span>
-          <span className="text-[11px] text-slate-400 block mt-0.5 capitalize">
-            {tenant?.status || "Active Resident"}
-          </span>
-        </div>
-      </div>
-
-      {/* Financial Status Banner (Phase 4 Preview) */}
-      <div className="bg-white rounded-2xl border border-slate-200/80 p-6 shadow-sm">
-        <div className="flex items-center justify-between mb-4">
-          <div className="flex items-center gap-2.5">
-            <div className="w-9 h-9 rounded-xl bg-emerald-100 text-emerald-700 flex items-center justify-center">
-              <CreditCard className="w-5 h-5" />
-            </div>
-            <div>
-              <h3 className="font-bold text-slate-900 text-sm">Monthly Rent Ledger</h3>
-              <p className="text-xs text-slate-500">Razorpay UPI &amp; Instant Receipts</p>
-            </div>
-          </div>
-          <span className="px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-800">
-            Up to Date
-          </span>
-        </div>
-        <p className="text-xs text-slate-600 leading-relaxed">
-          Your rent bills, digital payment receipts, and security deposit ledger are tracked here with immutable accounting.
-        </p>
-      </div>
-
-      {/* Services Grid (Phase 3 Modules) */}
-      <div className="bg-white rounded-2xl border border-slate-200/80 p-6 shadow-sm">
-        <h3 className="font-bold text-slate-900 text-sm mb-4">Resident Services</h3>
-        <div className="grid grid-cols-2 gap-3">
-          <div className="p-3.5 rounded-xl border border-slate-100 bg-slate-50 text-center">
-            <UtensilsCrossed className="w-5 h-5 text-emerald-600 mx-auto mb-1.5" />
-            <span className="font-bold text-xs text-slate-800 block">Today&apos;s Mess Menu</span>
-            <span className="text-[10px] text-slate-400">Breakfast • Lunch • Dinner</span>
-          </div>
-
-          <div className="p-3.5 rounded-xl border border-slate-100 bg-slate-50 text-center">
-            <AlertCircle className="w-5 h-5 text-amber-600 mx-auto mb-1.5" />
-            <span className="font-bold text-xs text-slate-800 block">Raise Complaint</span>
-            <span className="text-[10px] text-slate-400">Wifi • Plumbing • Cleaning</span>
-          </div>
-        </div>
-      </div>
-    </div>
+    <TenantDashboardClient
+      pg={pg}
+      tenant={tenantInfo}
+      complaints={tenantComplaints}
+      menuItems={menuItems}
+    />
   );
 }
