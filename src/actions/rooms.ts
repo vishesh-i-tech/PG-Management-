@@ -73,6 +73,20 @@ export async function createBedAction(formData: FormData): Promise<ActionResult>
     return { success: false, error: "Please provide valid bed label and monthly rent." };
   }
 
+  // SaaS Tier Feature Gate Check
+  const maxBedLimit = parseInt(process.env.DEFAULT_BED_LIMIT || "100", 10);
+  const { count: currentBedCount } = await supabase
+    .from("beds")
+    .select("id", { count: "exact", head: true })
+    .eq("pg_id", pgId);
+
+  if ((currentBedCount || 0) >= maxBedLimit) {
+    return {
+      success: false,
+      error: `Plan limit reached (${maxBedLimit} beds). Please upgrade your subscription to expand capacity.`,
+    };
+  }
+
   const { data, error } = await supabase
     .from("beds")
     .insert({

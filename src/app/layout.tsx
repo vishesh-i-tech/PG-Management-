@@ -5,7 +5,7 @@ import { PWAProvider } from "@/components/providers/PWAProvider";
 export const metadata: Metadata = {
   title: "PG Manager | The Layout Office",
   description: "Enterprise-Grade Multi-Tenant PG & Hostel Management Platform",
-  manifest: "/manifest.json",
+  manifest: "/manifest.webmanifest",
   appleWebApp: {
     capable: true,
     statusBarStyle: "default",
