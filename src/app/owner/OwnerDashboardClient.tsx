@@ -15,6 +15,7 @@ import {
 import { ComplaintsBoard, type ComplaintItem } from "@/components/dashboard/ComplaintsBoard";
 import { InquiriesCRM, type InquiryItem } from "@/components/dashboard/InquiriesCRM";
 import { MessMenuPlanner, type MessMenuItem } from "@/components/dashboard/MessMenuPlanner";
+import { FinancialLedger, type RentRecordItem, type PaymentItem } from "@/components/dashboard/FinancialLedger";
 import { 
   UserPlus, 
   BedDouble, 
@@ -26,7 +27,8 @@ import {
   Sparkles,
   LayoutDashboard,
   Clock,
-  AlertTriangle
+  AlertTriangle,
+  DollarSign
 } from "lucide-react";
 
 interface OwnerDashboardClientProps {
@@ -55,6 +57,8 @@ interface OwnerDashboardClientProps {
   complaints: ComplaintItem[];
   inquiries: InquiryItem[];
   menuItems: MessMenuItem[];
+  rentRecords?: RentRecordItem[];
+  recentPayments?: PaymentItem[];
 }
 
 export function OwnerDashboardClient({
@@ -72,9 +76,11 @@ export function OwnerDashboardClient({
   complaints,
   inquiries,
   menuItems,
+  rentRecords = [],
+  recentPayments = [],
 }: OwnerDashboardClientProps) {
   const [activeTab, setActiveTab] = useState<
-    "overview" | "rooms" | "tenants" | "gate" | "complaints" | "inquiries" | "mess"
+    "overview" | "rooms" | "tenants" | "gate" | "complaints" | "inquiries" | "mess" | "finances"
   >("overview");
   const [isInviteOpen, setIsInviteOpen] = useState(false);
 
@@ -83,6 +89,9 @@ export function OwnerDashboardClient({
   const occupiedBeds = rooms.reduce((acc, r) => acc + r.beds.filter((b) => b.status === "occupied").length, 0);
   const openComplaints = complaints.filter((c) => c.status === "open" || c.status === "in_progress").length;
   const activeTenantsCount = tenants.filter((t) => t.status === "active").length;
+  const totalCollected = rentRecords.reduce((acc, r) => acc + (r.paid_amount || 0), 0);
+  const totalBalanceDue = rentRecords.reduce((acc, r) => acc + (r.balance_due || 0), 0);
+  const pendingBillsCount = rentRecords.filter((r) => r.status === "pending" || r.status === "partially_paid" || r.status === "overdue").length;
 
   return (
     <div className="space-y-6">
@@ -124,6 +133,7 @@ export function OwnerDashboardClient({
           { key: "complaints", label: "Issues / Tickets", icon: Wrench, count: openComplaints },
           { key: "inquiries", label: "Leads & CRM", icon: MessageSquare, count: inquiries.length },
           { key: "mess", label: "Mess Menu", icon: UtensilsCrossed },
+          { key: "finances", label: "Finances & Rent", icon: DollarSign, count: pendingBillsCount },
         ].map((tab) => {
           const Icon = tab.icon;
           const isActive = activeTab === tab.key;
@@ -160,31 +170,43 @@ export function OwnerDashboardClient({
       {activeTab === "overview" && (
         <div className="space-y-6">
           {/* Top KPI Cards */}
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-sm">
-              <span className="text-xs font-bold text-slate-500 uppercase tracking-wider block">Total Occupancy</span>
-              <div className="text-2xl font-black text-slate-900 mt-1">
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3.5">
+            <div className="bg-white p-4 rounded-2xl border border-slate-200/80 shadow-xs">
+              <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block">Occupancy</span>
+              <div className="text-xl font-black text-slate-900 mt-1">
                 {totalBeds > 0 ? Math.round((occupiedBeds / totalBeds) * 100) : 0}%
               </div>
-              <span className="text-xs text-slate-500">{occupiedBeds} occupied / {totalBeds} total beds</span>
+              <span className="text-[10px] text-slate-500">{occupiedBeds}/{totalBeds} Beds</span>
             </div>
 
-            <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-sm">
-              <span className="text-xs font-bold text-slate-500 uppercase tracking-wider block">Active Residents</span>
-              <div className="text-2xl font-black text-emerald-700 mt-1">{activeTenantsCount}</div>
-              <span className="text-xs text-slate-500">{availableTenants.length} awaiting bed allocation</span>
+            <div className="bg-white p-4 rounded-2xl border border-slate-200/80 shadow-xs">
+              <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block">Residents</span>
+              <div className="text-xl font-black text-emerald-700 mt-1">{activeTenantsCount}</div>
+              <span className="text-[10px] text-slate-500">{availableTenants.length} unallocated</span>
             </div>
 
-            <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-sm">
-              <span className="text-xs font-bold text-slate-500 uppercase tracking-wider block">Gate Presence</span>
-              <div className="text-2xl font-black text-blue-700 mt-1">{gateSummary.inside_count} Inside</div>
-              <span className="text-xs text-slate-500">{gateSummary.outside_count} outside • {gateSummary.night_out_count} night out</span>
+            <div className="bg-white p-4 rounded-2xl border border-slate-200/80 shadow-xs">
+              <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block">Gate Presence</span>
+              <div className="text-xl font-black text-blue-700 mt-1">{gateSummary.inside_count} In</div>
+              <span className="text-[10px] text-slate-500">{gateSummary.outside_count} Out • {gateSummary.night_out_count} N-Out</span>
             </div>
 
-            <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-sm">
-              <span className="text-xs font-bold text-slate-500 uppercase tracking-wider block">Open Tickets</span>
-              <div className="text-2xl font-black text-amber-700 mt-1">{openComplaints}</div>
-              <span className="text-xs text-slate-500">{pendingNightOuts.length} night-out approvals pending</span>
+            <div className="bg-white p-4 rounded-2xl border border-slate-200/80 shadow-xs">
+              <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block">Open Tickets</span>
+              <div className="text-xl font-black text-amber-700 mt-1">{openComplaints}</div>
+              <span className="text-[10px] text-slate-500">{pendingNightOuts.length} night-out reqs</span>
+            </div>
+
+            <div className="bg-white p-4 rounded-2xl border border-slate-200/80 shadow-xs">
+              <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block">Rent Collected</span>
+              <div className="text-xl font-black text-emerald-600 mt-1">₹{totalCollected.toLocaleString("en-IN")}</div>
+              <span className="text-[10px] text-slate-500">{recentPayments.length} recorded payments</span>
+            </div>
+
+            <div className="bg-white p-4 rounded-2xl border border-slate-200/80 shadow-xs">
+              <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block">Outstanding Due</span>
+              <div className="text-xl font-black text-rose-600 mt-1">₹{totalBalanceDue.toLocaleString("en-IN")}</div>
+              <span className="text-[10px] text-slate-500">{pendingBillsCount} pending invoices</span>
             </div>
           </div>
 
@@ -335,6 +357,15 @@ export function OwnerDashboardClient({
         <MessMenuPlanner
           pgId={pg.id}
           menuItems={menuItems}
+          canManage={true}
+        />
+      )}
+
+      {activeTab === "finances" && (
+        <FinancialLedger
+          pgId={pg.id}
+          rentRecords={rentRecords}
+          recentPayments={recentPayments}
           canManage={true}
         />
       )}

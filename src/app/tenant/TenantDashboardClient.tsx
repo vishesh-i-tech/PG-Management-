@@ -17,7 +17,9 @@ import {
 import { recordGateMovementAction, requestNightOutAction } from "@/actions/gate";
 import { ComplaintsBoard, type ComplaintItem } from "@/components/dashboard/ComplaintsBoard";
 import { MessMenuPlanner, type MessMenuItem } from "@/components/dashboard/MessMenuPlanner";
+import { TenantPaymentModal, type TenantRentBill } from "@/components/dashboard/TenantPaymentModal";
 import type { GateState } from "@/types/database.types";
+import { Receipt } from "lucide-react";
 
 export interface TenantInfo {
   id: string;
@@ -51,6 +53,7 @@ interface TenantDashboardClientProps {
   tenant: TenantInfo;
   complaints: ComplaintItem[];
   menuItems: MessMenuItem[];
+  bills?: TenantRentBill[];
 }
 
 export function TenantDashboardClient({
@@ -58,9 +61,12 @@ export function TenantDashboardClient({
   tenant,
   complaints,
   menuItems,
+  bills = [],
 }: TenantDashboardClientProps) {
-  const [activeTab, setActiveTab] = useState<"stay" | "gate" | "complaints" | "mess">("stay");
+  const [activeTab, setActiveTab] = useState<"stay" | "payments" | "gate" | "complaints" | "mess">("stay");
   const [isNightOutOpen, setIsNightOutOpen] = useState(false);
+
+  const pendingBillsCount = bills.filter((b) => b.balance_due > 0 && b.status !== "paid").length;
 
   const [loading, setLoading] = useState(false);
   const [gateMsg, setGateMsg] = useState<string | null>(null);
@@ -172,6 +178,7 @@ export function TenantDashboardClient({
       <div className="flex items-center gap-1.5 bg-white p-1.5 rounded-2xl border border-slate-200/90 shadow-xs overflow-x-auto">
         {[
           { key: "stay", label: "My Stay & Room", icon: BedDouble },
+          { key: "payments", label: "Rent & Bills", icon: Receipt, count: pendingBillsCount },
           { key: "gate", label: "Gate & Night-Out", icon: DoorClosed },
           { key: "complaints", label: "Maintenance Tickets", icon: Wrench, count: complaints.length },
           { key: "mess", label: "Today's Food Menu", icon: UtensilsCrossed },
@@ -323,6 +330,15 @@ export function TenantDashboardClient({
           pgId={pg.id}
           menuItems={menuItems}
           canManage={false}
+        />
+      )}
+
+      {activeTab === "payments" && (
+        <TenantPaymentModal
+          pgId={pg.id}
+          tenantId={tenant.id}
+          tenantName={tenant.full_name}
+          bills={bills}
         />
       )}
 

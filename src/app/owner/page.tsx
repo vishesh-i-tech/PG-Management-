@@ -8,6 +8,7 @@ import type { GateEventItem, NightOutRequestItem, CurfewAlertTenant, SimpleTenan
 import type { ComplaintItem } from "@/components/dashboard/ComplaintsBoard";
 import type { InquiryItem } from "@/components/dashboard/InquiriesCRM";
 import type { MessMenuItem } from "@/components/dashboard/MessMenuPlanner";
+import type { RentRecordItem, PaymentItem } from "@/components/dashboard/FinancialLedger";
 
 export default async function OwnerPage() {
   const context = await getAuthContext();
@@ -35,6 +36,8 @@ export default async function OwnerPage() {
     { data: rawInquiries },
     { data: rawFollowUps },
     { data: rawMenu },
+    { data: rawRentRecords },
+    { data: rawPayments },
   ] = await Promise.all([
     supabase.from("pgs").select("*").eq("id", pgId).single(),
     supabase.from("rooms").select("*").eq("pg_id", pgId).order("room_number", { ascending: true }),
@@ -50,6 +53,8 @@ export default async function OwnerPage() {
     supabase.from("inquiries").select("*").eq("pg_id", pgId).order("created_at", { ascending: false }).limit(30),
     supabase.from("inquiry_follow_ups").select("*").eq("pg_id", pgId).order("created_at", { ascending: false }),
     supabase.from("mess_menu").select("*").eq("pg_id", pgId).eq("is_active", true),
+    supabase.from("rent_records").select("*").eq("pg_id", pgId).order("due_date", { ascending: false }),
+    supabase.from("payments").select("*").eq("pg_id", pgId).order("created_at", { ascending: false }).limit(50),
   ]);
 
   if (!pg) {
@@ -254,6 +259,48 @@ export default async function OwnerPage() {
     special_notes: m.special_notes,
   }));
 
+  // 7. Finances & Ledgers
+  const rentRecords: RentRecordItem[] = (rawRentRecords || []).map((r) => {
+    const t = tenantMap.get(r.tenant_id);
+    const a = assignmentByTenantId.get(r.tenant_id);
+    const b = a ? bedMap.get(a.bed_id) : null;
+    const rm = b ? roomMap.get(b.room_id) : null;
+
+    return {
+      id: r.id,
+      pg_id: r.pg_id,
+      tenant_id: r.tenant_id,
+      tenant_name: t?.full_name || "Resident",
+      room_number: rm?.room_number || null,
+      bed_label: b?.bed_label || null,
+      billing_month: r.billing_month,
+      due_date: r.due_date,
+      base_rent_amount: r.base_rent_amount,
+      utility_charges: r.utility_charges,
+      late_fees: r.late_fee_amount,
+      discount_amount: r.discount_amount,
+      total_amount_due: r.total_due_amount,
+      paid_amount: r.paid_amount,
+      balance_due: r.balance_amount,
+      status: r.status,
+      created_at: r.created_at,
+    };
+  });
+
+  const recentPayments: PaymentItem[] = (rawPayments || []).map((p) => {
+    const t = tenantMap.get(p.tenant_id);
+    return {
+      id: p.id,
+      tenant_id: p.tenant_id,
+      tenant_name: t?.full_name || "Resident",
+      amount: p.amount,
+      payment_method: p.payment_method,
+      payment_status: p.payment_status,
+      notes: p.notes,
+      created_at: p.created_at,
+    };
+  });
+
   const availableBeds = rooms.flatMap((r) =>
     r.beds
       .filter((b) => b.status === "vacant")
@@ -285,6 +332,8 @@ export default async function OwnerPage() {
       complaints={complaints}
       inquiries={inquiries}
       menuItems={menuItems}
+      rentRecords={rentRecords}
+      recentPayments={recentPayments}
     />
   );
 }

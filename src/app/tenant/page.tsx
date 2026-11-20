@@ -4,6 +4,7 @@ import { redirect } from "next/navigation";
 import { TenantDashboardClient, type TenantInfo } from "./TenantDashboardClient";
 import type { ComplaintItem } from "@/components/dashboard/ComplaintsBoard";
 import type { MessMenuItem } from "@/components/dashboard/MessMenuPlanner";
+import type { TenantRentBill } from "@/components/dashboard/TenantPaymentModal";
 import type { GateState } from "@/types/database.types";
 
 export default async function TenantPage() {
@@ -25,6 +26,7 @@ export default async function TenantPage() {
     { data: rawBeds },
     { data: rawComplaints },
     { data: rawMenu },
+    { data: rawRentRecords },
   ] = await Promise.all([
     supabase.from("pgs").select("id, name, city, gate_closing_time").eq("id", pgId).single(),
     supabase.from("tenants").select("*").eq("pg_id", pgId).eq("user_id", context.userId).maybeSingle(),
@@ -33,6 +35,7 @@ export default async function TenantPage() {
     supabase.from("beds").select("*").eq("pg_id", pgId),
     supabase.from("complaints").select("*").eq("pg_id", pgId).order("created_at", { ascending: false }),
     supabase.from("mess_menu").select("*").eq("pg_id", pgId).eq("is_active", true),
+    supabase.from("rent_records").select("*").eq("pg_id", pgId).order("due_date", { ascending: false }),
   ]);
 
   if (!pg) {
@@ -142,12 +145,32 @@ export default async function TenantPage() {
     special_notes: m.special_notes,
   }));
 
+  const bills: TenantRentBill[] = (rawRentRecords || [])
+    .filter((b) => !rawTenant || b.tenant_id === rawTenant.id)
+    .map((b) => ({
+      id: b.id,
+      pg_id: b.pg_id,
+      billing_month: b.billing_month,
+      period_start: b.period_start,
+      period_end: b.period_end,
+      due_date: b.due_date,
+      base_rent_amount: b.base_rent_amount,
+      utility_charges: b.utility_charges,
+      late_fees: b.late_fee_amount,
+      discount_amount: b.discount_amount,
+      total_amount_due: b.total_due_amount,
+      paid_amount: b.paid_amount,
+      balance_due: b.balance_amount,
+      status: b.status,
+    }));
+
   return (
     <TenantDashboardClient
       pg={pg}
       tenant={tenantInfo}
       complaints={tenantComplaints}
       menuItems={menuItems}
+      bills={bills}
     />
   );
 }
