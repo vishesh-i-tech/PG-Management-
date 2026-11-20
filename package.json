@@ -9,6 +9,7 @@
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "db:validate": "node scripts/validate-migrations.js",
+    "test:invariants": "node scripts/test-invariants.mjs",
     "review:phase": "node scripts/gpt-gatekeeper.mjs",
     "review:gpt": "node scripts/gpt-gatekeeper.mjs"
   },
