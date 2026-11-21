@@ -8,15 +8,22 @@ const config: Config = {
   ],
   theme: {
     extend: {
+      fontFamily: {
+        serif: ["'Playfair Display'", "Georgia", "serif"],
+        sans: ["'Plus Jakarta Sans'", "Inter", "system-ui", "sans-serif"],
+      },
       colors: {
         background: "var(--background)",
         foreground: "var(--foreground)",
-        primary: {
-          50: "#f0fdf4",
-          100: "#dcfce7",
-          500: "#22c55e",
-          600: "#16a34a",
-          700: "#15803d",
+        haven: {
+          gold: "#C5A880",
+          goldLight: "#E5D5C1",
+          goldDark: "#A88455",
+          dark: "#070F15",
+          cardDark: "#0D1820",
+          teal: "#0A1D24",
+          cream: "#FAF8F5",
+          sand: "#F3EFEA",
         },
       },
     },
